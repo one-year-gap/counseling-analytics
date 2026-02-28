@@ -1,0 +1,10 @@
+name: pr-verification
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  commit-policy:
+    uses: one-year-gap/infra/.github/workflows/commit-policy.yml@main
+    
