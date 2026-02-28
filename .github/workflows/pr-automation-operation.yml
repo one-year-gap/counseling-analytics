@@ -1,0 +1,17 @@
+name: PR Automation
+
+on:
+  pull_request:
+    types: [opened, closed]
+
+jobs:
+  call-infra-sync:
+    if: github.event.action == 'opened' || (github.event.action == 'closed' && github.event.pull_request.merged == true)
+    uses: one-year-gap/infra/.github/workflows/jira-sync-on-pr.yml@main
+    secrets:
+      JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      
+      SLACK_WEBHOOK_BE: ${{ secrets.SLACK_WEBHOOK_BE }}
+      SLACK_WEBHOOK_DEFAULT: ${{ secrets.SLACK_WEBHOOK_DEFAULT }}
