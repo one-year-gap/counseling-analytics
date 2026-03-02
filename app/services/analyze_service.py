@@ -10,7 +10,7 @@
 
 import json
 import re
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.core.config import Settings
@@ -106,7 +106,7 @@ class AnalyzeService:
     def _build_results(self, request: AnalyzeRequest, counsel_records, alias_records, chunk_id: str) -> list[ResultRecord]:
         """상담 1건마다 키워드별 횟수를 계산해 결과 생성."""
         rows: list[ResultRecord] = []
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
 
         # alias 사전을 정규식 목록으로 미리 컴파일해, 상담 루프에서 재사용
         keyword_patterns: list[tuple[int, str, str, list[re.Pattern[str]]]] = []
@@ -188,7 +188,7 @@ class AnalyzeService:
             "outputFile": str(output_file),
             "recordCount": record_count,
             "status": "processed",
-            "processedAt": datetime.now(UTC).isoformat(),
+            "processedAt": datetime.now(timezone.utc).isoformat(),
         }
 
     def _write_json_atomic(self, path: Path, payload: dict[str, object]) -> None:
