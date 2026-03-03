@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import List, Dict
+from typing import List, Dict, Any
 
 # 텍스트 정규화 모듈
 from app.pipeline.normalizer import normalize
@@ -48,10 +48,11 @@ class ExactMapper:
                 if norm_alias:
                     self.alias_norm_index[norm_alias].append(label_id)
 
-    def exact_match(self, raw_text: str) -> List[str]:
+    def exact_match(self, raw_text: str) -> List[Dict[str, Any]]:
         """
         [분석 단계] 단건 상담 텍스트 분석 요청 시 실행
         고객의 입력 텍스트가 구축된 인덱스의 키워드와 "완전 일치(Exact Match)" 하는지 검사
+        Service의 통합 처리를 위해 Stage 2와 동일한 Dict 구조 반환
         """
         # 입력된 원문 텍스트에 동일한 정규화 파이프라인 적용
         norm_text = normalize(raw_text)
@@ -59,19 +60,42 @@ class ExactMapper:
         # 정규화 결과가 빈 문자열인 경우 (특수문자/공백만 존재 시) 매칭을 중단하고 빈 리스트 반환
         if not norm_text:
             return []
+        
+        matched_ids = []
+        source = ""
 
         # 1순위: 표준 키워드(Canonical) 인덱스 매칭 검사 (가장 높은 우선순위)
         match = self.canon_norm_index.get(norm_text)
         if match:
-            return match
+            matched_ids = match
+            source = "CANON"
 
         # 2순위: 별칭(Alias) 인덱스 매칭 검사
         match = self.alias_norm_index.get(norm_text)
         if match:
-            return match
+            matched_ids = match
+            source = "ALIAS"
 
         # 완전 일치 항목이 없는 경우 빈 리스트 반환 (이후 파이프라인인 Stage 2 Aho-Corasick 단계로 이관)
-        return []
+        if not matched_ids:
+            return []
+        
+        # 3. Stage 2(Aho-Corasick)와 규격을 맞춘 결과 리스트 생성
+        # Stage 1은 문장 전체가 100% 일치한 경우이므로, 
+        # 원본의 시작점(0)부터 끝점(길이-1)까지가 모두 키워드 영역이 됨
+        results = []
+        for label_id in matched_ids:
+            results.append({
+                "keyword_id": label_id,
+                "source": source,
+                "orig_start": 0,                              # 원본 문장의 맨 앞
+                "orig_end": len(raw_text) - 1,                # 원본 문장의 맨 뒤
+                "norm_start": 0,                              # 정규화 문장의 맨 앞
+                "norm_end": len(norm_text) - 1,               # 정규화 문장의 맨 뒤
+                "match_type": "EXACT_MATCH"                   # 1단계 출신임을 꼬리표로 명시
+            })
+            
+        return results
 
 
 # 테스트 공간
@@ -115,9 +139,13 @@ if __name__ == "__main__":
         customer_text = req.get("text", "")
         
         # O(1) 매칭 검사
-        matched_ids = mapper.exact_match(customer_text)
+        results = mapper.exact_match(customer_text)
         
-        if matched_ids:
-            print(f"[매칭 성공] 원문: '{customer_text}'\n   ➔ 매핑된 Label ID: {matched_ids}\n")
+        if results:
+            print(f"[매칭 성공] 원문: '{customer_text}'")
+            # 딕셔너리로 바뀐 결과물 출력
+            for res in results:
+                print(f"   ➔ 반환 데이터: {res}")
+            print()
         else:
-            print(f"[매칭 실패] 원문: '{customer_text}'\n   ➔ (완전 일치 실패. Stage 2 Aho-Corasick 파이프라인으로 이관 필요)\n")
+            print(f"[매칭 실패] 원문: '{customer_text}'\n   ➔ (Stage 2 이관)\n")
