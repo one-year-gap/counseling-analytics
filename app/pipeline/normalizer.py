@@ -1,12 +1,18 @@
 import re
 from typing import Tuple, List
 
+# 모듈이 로드될 때 정규식 기계를 딱 한 번만 미리 조립(컴파일)해 둠
+# 1. 기호 제거용 (부정형 패턴: 알파벳, 숫자, 한글이 '아닌' 것들)
+_NON_ALPHANUM_PATTERN = re.compile(r'[^a-z0-9가-힣]')
+# 2. 글자 확인용 (긍정형 패턴: 알파벳, 숫자, 한글이 '맞는' 것들)
+_ALPHANUM_PATTERN = re.compile(r'[a-z0-9가-힣]')
+
 def normalize(raw_text: str) -> str:
     # 인덱스 구축용 정규화
     if not raw_text or not raw_text.strip():
         return ""
     normalized = raw_text.lower()
-    return re.sub(r'[^a-z0-9가-힣]', '', normalized)
+    return _NON_ALPHANUM_PATTERN.sub('', normalized)
 
 def normalize_with_offsets(raw_text: str) -> Tuple[str, List[int]]:
     """
@@ -26,7 +32,7 @@ def normalize_with_offsets(raw_text: str) -> Tuple[str, List[int]]:
     # 원문 글자를 하나씩 돌면서 검사
     for i, char in enumerate(lower_text):
         # 정규식 패턴에 맞는(허용된) 글자일 때만
-        if re.match(r'[a-z0-9가-힣]', char):
+        if _ALPHANUM_PATTERN.match(char):
             normalized_chars.append(char) # 정규화 결과에 추가
             offset_map.append(i)          # 이 글자의 원본 인덱스를 지도에 기록
             
