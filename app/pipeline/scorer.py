@@ -1,10 +1,12 @@
 import spacy
 from typing import List, Dict, Any
+# rapidfuzz: C++ 기반의 초고속 문자열 비교 라이브러리
+from rapidfuzz.distance import DamerauLevenshtein
 
 class ContextScorer:
     """
     [Stage 3] 문맥 분석 및 오타 교정 심판관 (spaCy 기반)
-    1, 2단계에서 넘어온 결과를 바탕으로 중의성을 해결(Disambiguation)하고, 
+    1, 2단계에서 넘어온 결과를 바탕으로 중의성을 해결하고, 
     놓친 오타를 구출(Fallback)하는 최종 분석기
     """
 
@@ -68,12 +70,79 @@ class ContextScorer:
                 
         return best_candidate
 
-    def rescue_typos(self, doc: spacy.tokens.Doc, masked_text: str) -> List[Dict[str, Any]]:
+    def rescue_typos(self, doc: spacy.tokens.Doc, masked_text: str, canon_index: Dict[str, List[str]], alias_index: Dict[str, List[str]]) -> List[Dict[str, Any]]:
         """
         [패자부활전 로직] 
-        1, 2단계가 찾은 걸 다 지워버린(Masking) 문장에서, 남은 명사들만 뽑아 기본 매핑, 오타를 검사
+        지배인이 1,2단계에서 찾은 단어를 '*'로 마스킹(Masking)한 문장(masked_text)을 받는다.
+        남은 찌꺼기 텍스트에서 명사를 뭉쳐서 O(1) 검사 후, 실패 시 다메라우 오타 검사를 진행.
         """
-        pass
+        rescued_results = []
+        nouns_to_check = [] # 검사할 명사 덩어리 보관함
+        current_noun = ""
+        start_idx = -1
+
+        # --- STEP 1: 미탐 영역 형태소 분석 (명사 찰흙놀이) ---
+        for token in doc:
+            # token.idx 위치가 마스킹('*') 되어있다면, 이미 1,2단계에서 찾은 단어이므로 무시
+            if masked_text[token.idx] == "*":
+                if current_noun:
+                    nouns_to_check.append((current_noun, start_idx, token.idx - 1))
+                    current_noun = ""
+                continue
+
+            # 명사(NOUN)이면 계속 이어 붙입니다. (예: '선텍' + '약정')
+            if token.pos_ in ["NOUN", "PROPN"]:
+                if not current_noun:
+                    start_idx = token.idx
+                current_noun += token.text
+            else:
+                # 명사가 끝났으면 (예: 조사가 나오면) 지금까지 뭉친 명사를 검사 후보 리스트에 넣음
+                if current_noun:
+                    # 끝 인덱스 = 시작 인덱스 + 뭉친 단어 길이 - 1
+                    nouns_to_check.append((current_noun, start_idx, start_idx + len(current_noun) - 1))
+                    current_noun = ""
+                    
+        # 문장 끝까지 명사로 끝났을 경우를 대비해 마지막 털기
+        if current_noun:
+            nouns_to_check.append((current_noun, start_idx, start_idx + len(current_noun) - 1))
+
+        # --- STEP 2: O(1) 매칭 및 다메라우 연산 ---
+        for noun_text, s, e in nouns_to_check:
+            # 글자가 2글자 미만(예: '나', '저')이면 오타 검사에서 제외 (무의미한 연산 방지)
+            if len(noun_text) < 2:
+                continue
+
+            # [핵심 로직 1] O(1) 완전 매칭 검사
+            # Mapper가 만든 사전을 보고, "이 덩어리가 혹시 오타가 아니라 진짜 단어 아니야?" 확인
+            matched_ids = canon_index.get(noun_text) or alias_index.get(noun_text)
+                
+            if matched_ids:
+                # 사전에 완벽하게 있으면 오타 검사 패스
+                rescued_results.append({
+                    "keyword_id": matched_ids[0],
+                    "source": "FALLBACK_EXACT", # 정확히 일치해서 구출됨
+                    "orig_start": s,
+                    "orig_end": e,
+                    "rescued_word": noun_text
+                })
+                continue # 다음 명사 덩어리로 넘어감
+
+            # [핵심 로직 2] 다메라우 연산 (rapidfuzz 활용 오타 검사)
+            # O(1)에서 실패했으니, 이제 진짜 오타인지 단어장을 돌면서 검사
+            for dict_word, label_ids in canon_index.items():
+                # DamerauLevenshtein: 글자 바뀜, 순서 바뀜 등을 C++ 엔진으로 초고속 계산
+                # 거리 1 = 1글자만 틀린 오타
+                if DamerauLevenshtein.distance(noun_text, dict_word) == 1:
+                    rescued_results.append({
+                        "keyword_id": label_ids[0],
+                        "source": "FALLBACK_TYPO", # 오타를 교정해서 구출됨
+                        "orig_start": s,
+                        "orig_end": e,
+                        "rescued_word": noun_text
+                    })
+                    break # 오타 찾았으면 더 안 찾아도 됨
+
+        return rescued_results
 
 
 # 테스트 공간
@@ -112,3 +181,48 @@ if __name__ == "__main__":
     print(f" - 심사 후보: {candidates}")
     print(f" - 제공된 마스터 키워드 정보: {keyword_meta}")
     print(f" ➔ 문맥 채점 기반 최종 1등: {winner_id} ({keyword_meta[winner_id]})")
+
+    # ---------------------------------------------------------
+    # 패자부활전(Fallback) 로직 검증
+    # O(1) 완전 매칭과 rapidfuzz 오타 교정이 잘 작동하는지 확인
+    # ---------------------------------------------------------
+    print("\n" + "="*50)
+    print("--- 패자부활전(Fallback) 테스트 시작 ---")
+    
+    # 7. 패자부활전용 가상의 고객 입력
+    # 상황: 1, 2단계가 오류로 인해 단어를 하나도 못 찾았다고 가정
+    fallback_text = "선텍약정 언제 끝나고 스마트폰 어떻게 해요?"
+    fallback_masked = "선텍약정 언제 끝나고 스마트폰 어떻게 해요?"
+    
+    print(f" - 원본 문장: '{fallback_text}'")
+    
+    # 8. 패자부활전용 문법 지도 생성
+    fallback_doc = scorer.parse_document(fallback_text)
+
+    # 9. Mapper가 서버 시작 시 만들어둔 단어장(Hash Map) 흉내내기
+    # - 선택약정: 오타 테스트용 (선텍약정 -> 1글자 오타)
+    # - 스마트폰: O(1) 매칭 테스트용 (토시 하나 안 틀리고 똑같음)
+    mock_canon_index = {
+        "선택약정": ["BK-025"], 
+        "스마트폰": ["BK-047"]
+    }
+    mock_alias_index = {} # 별칭 단어장은 비어있다고 가정
+
+    # 10. 패자부활전(rescue_typos) 실행
+    rescued_results = scorer.rescue_typos(fallback_doc, fallback_masked, mock_canon_index, mock_alias_index)
+
+    print("\n[패자부활전 결과]")
+    if not rescued_results:
+        print(" ➔ 구출된 단어가 없습니다.")
+    else:
+        for res in rescued_results:
+            print(f"구출 성공! 추출된 단어: '{res['rescued_word']}'")
+            print(f"   ➔ 매핑된 라벨 ID: {res['keyword_id']}")
+            print(f"   ➔ 구출 사유(Source): {res['source']}")
+            
+            # 구출 사유에 대한 설명 출력
+            if res['source'] == "FALLBACK_EXACT":
+                print("   ➔ (설명: 단어장에 완벽하게 똑같은 단어가 있어서 O(1) 매칭으로 구출됨)")
+            elif res['source'] == "FALLBACK_TYPO":
+                print("   ➔ (설명: rapidfuzz 검사 결과 1글자 오타로 판명되어 교정 후 구출됨)")
+            print("-" * 30)
