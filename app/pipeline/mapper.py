@@ -5,6 +5,10 @@ from typing import List, Dict
 from app.pipeline.normalizer import normalize
 
 class ExactMapper:
+    # 스키마 상수를 클래스 변수로 정의 (오타 방지 및 유지보수성 향상)
+    _KEYWORD_SCHEMA = "dict.keyword.v1"
+    _ALIAS_SCHEMA = "dict.alias.v1"
+
     def __init__(self):
         # 두 개의 O(1) 검색용 메모리 인덱스(Hash Map) 초기화
         # 구조: { "정규화된_텍스트": ["label_id_1", "label_id_2"] }
@@ -30,7 +34,7 @@ class ExactMapper:
             schema = item.get("schema", "")
 
             # 1. 표준 키워드(Canonical) 데이터 적재
-            if schema == "dict.keyword.v1":
+            if schema == self._KEYWORD_SCHEMA:
                 business_keyword = item.get("business_keyword")
                 if business_keyword:
                     # 텍스트 정규화 수행 후 인덱스에 매핑
@@ -39,12 +43,10 @@ class ExactMapper:
                         self.canon_norm_index[norm_canon].append(label_id)
 
             # 2. 별칭(Alias) 데이터 적재
-            elif schema == "dict.alias.v1":
-                alias_text = item.get("alias_text")
-                if alias_text:
-                    norm_alias = item.get("alias_norm")
-                    if norm_alias:
-                        self.alias_norm_index[norm_alias].append(label_id)
+            elif schema == self._ALIAS_SCHEMA:
+                norm_alias = item.get("alias_norm")
+                if norm_alias:
+                    self.alias_norm_index[norm_alias].append(label_id)
 
     def exact_match(self, raw_text: str) -> List[str]:
         """
