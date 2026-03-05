@@ -24,17 +24,23 @@ def resolve_efs_path(base_dir: Path, requested_path: str) -> Path:
 
 def build_req_dir(base_dir: Path, job_instance_id: str) -> Path:
     # Spring이 올려둔 입력 chunk들이 있는 위치
-    return (base_dir / "analysis" / "req" / job_instance_id).resolve()
+    # [수정] 외부 입력값이 포함된 경로를 resolve_efs_path로 검증
+    target = f"analysis/req/{job_instance_id}"
+    return resolve_efs_path(base_dir, target)
 
 
 def build_res_dir(base_dir: Path, job_instance_id: str) -> Path:
     # Python이 처리 결과를 저장하는 위치
-    return (base_dir / "analysis" / "res" / job_instance_id).resolve()
+    # [수정] 외부 입력값이 포함된 경로를 resolve_efs_path로 검증
+    target = f"analysis/res/{job_instance_id}"
+    return resolve_efs_path(base_dir, target)
 
 
 def build_ref_alias_path(base_dir: Path, analysis_version: str) -> Path:
     # 예: /mnt/efs/analysis/ref/v1.alias.jsonl.gz
-    return (base_dir / "analysis" / "ref" / f"{analysis_version}{ALIAS_FILE_SUFFIX}").resolve()
+   # [수정] 외부 입력값이 포함된 경로를 resolve_efs_path로 검증
+    target = f"analysis/ref/{analysis_version}{ALIAS_FILE_SUFFIX}"
+    return resolve_efs_path(base_dir, target)
 
 
 def list_chunk_inputs(req_dir: Path) -> list[Path]:
