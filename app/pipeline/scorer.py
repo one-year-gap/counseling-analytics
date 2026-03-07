@@ -83,13 +83,13 @@ class ContextScorer:
         start_idx = -1
 
         # [디버깅 1] 단어장이 제대로 넘어왔는지 확인
-        print(f"\n[디버깅-다메라우] 넘겨받은 원본 텍스트: '{doc.text}'")
-        print(f"[디버깅-다메라우] 단어장 상태 (Canon): {canon_index}")
+        # print(f"\n[디버깅-다메라우] 넘겨받은 원본 텍스트: '{doc.text}'")
+        # print(f"[디버깅-다메라우] 단어장 상태 (Canon): {canon_index}")
 
         # --- STEP 1: 미탐 영역 형태소 분석 (명사 찰흙놀이) ---
         for token in doc:
             # [디버깅 2] spaCy가 단어를 어떻게 분류했는지 하나하나 확인
-            print(f"  > 분석중 토큰: '{token.text}' (pos: {token.pos_}, idx: {token.idx})")
+            # print(f"  > 분석중 토큰: '{token.text}' (pos: {token.pos_}, idx: {token.idx})")
 
             # token.idx 위치가 마스킹('*') 되어있다면, 이미 1,2단계에서 찾은 단어이므로 무시
             if masked_text[token.idx] == "*":
@@ -120,7 +120,7 @@ class ContextScorer:
             nouns_to_check.append((current_noun, start_idx, start_idx + len(current_noun) - 1))
 
         # [디버깅 3] spaCy가 최종적으로 뭉쳐낸 '명사 덩어리' 확인
-        print(f"[디버깅-다메라우] 최종 검사할 명사 덩어리들: {nouns_to_check}")
+        # print(f"[디버깅-다메라우] 최종 검사할 명사 덩어리들: {nouns_to_check}")
 
         # --- STEP 2: O(1) 매칭 및 다메라우 연산 ---
         for noun_text, s, e in nouns_to_check:
@@ -144,7 +144,7 @@ class ContextScorer:
                 continue # 다음 명사 덩어리로 넘어감
 
             # [디버깅 4] 다메라우 연산 진입 확인
-            print(f"[디버깅-다메라우] '{noun_text}' 단어에 대해 오타 검사 시작!")
+            # print(f"[디버깅-다메라우] '{noun_text}' 단어에 대해 오타 검사 시작!")
 
             # [핵심 로직 2] 다메라우 연산 (rapidfuzz 활용 오타 검사)
             # O(1)에서 실패했으니, 이제 진짜 오타인지 단어장을 돌면서 검사
@@ -154,11 +154,11 @@ class ContextScorer:
                 dist = DamerauLevenshtein.distance(noun_text, dict_word)
                 
                 # [디버깅 5] 모든 비교 결과 출력
-                print(f"  - 비교: '{noun_text}' vs '{dict_word}' -> Distance: {dist}")
+                # print(f"  - 비교: '{noun_text}' vs '{dict_word}' -> Distance: {dist}")
 
                 # 거리 1 = 1글자만 틀린 오타
                 if dist == 1:
-                    print(f"[구출 성공!] '{noun_text}'는 '{dict_word}'의 오타입니다.")
+                    # print(f"[구출 성공!] '{noun_text}'는 '{dict_word}'의 오타입니다.")
                     rescued_results.append({
                         "keyword_id": label_ids[0],
                         "source": "FALLBACK_TYPO", # 오타를 교정해서 구출됨
