@@ -1,4 +1,4 @@
-"""FastAPI application entrypoint for Kafka consumer runtime."""
+"""FastAPI application entrypoint. REST API + Kafka consumer runtime."""
 
 if __package__ is None or __package__ == "":
     import os
@@ -8,6 +8,8 @@ if __package__ is None or __package__ == "":
 
 from fastapi import FastAPI
 
+from app.api.router import api_router
+from app.api.v1.health import public_router as public_health_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 
@@ -15,12 +17,14 @@ settings = get_settings()
 configure_logging(settings.debug)
 
 app = FastAPI(title=settings.app_name)
+app.include_router(public_health_router)
+app.include_router(api_router, prefix=settings.api_v1_prefix)
 consumer_service = None
 
 
 @app.get("/")
-def root() -> dict[str, str]:
-    return {"message": "counseling analytics worker is running"}
+async def root() -> dict[str, str]:
+    return {"app": settings.app_name, "docs": "/docs", "health": "/health"}
 
 
 @app.get("/health")
