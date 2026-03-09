@@ -5,3 +5,14 @@ pydantic-settings==2.8.0
 spacy>=3.7.0        
 pyahocorasick>=2.0.0  
 rapidfuzz>=3.6.0     
+langchain
+langchain-openai
+openai
+sqlalchemy[asyncio]
+asyncpg
+pgvector
+python-dotenv
+httpx
+orjson
+pytest
+pytest-asyncio
