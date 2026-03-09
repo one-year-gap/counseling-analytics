@@ -20,6 +20,6 @@ app.include_router(api_router, prefix=settings.api_v1_prefix)
 
 
 @app.get("/")
-def root() -> dict[str, str]:
-    #Root 확인용 엔드 포인트
-    return {"message": "counseling analytics api"}
+async def root() -> dict[str, str]:
+    return {"app": settings.app_name, "docs": "/docs", "health": "/health"}
+
