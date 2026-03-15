@@ -111,18 +111,22 @@ class CdcAnalysisService:
                         sentiment=analysis_result["sentiment"],
                         mappings=analysis_result["mappings"],
                     )
-                    
-                    # 4. Spring API 서버로 HTTP POST 전송
-                    response = await http_client.post(self._spring_api_url, json=payload)
-                    response.raise_for_status() # 200번대 성공이 아니면 예외 발생
-                    logger.info(f"[전송 성공] case_id={case_id} 분석 완료 및 Spring 전송 성공")
 
-                    # 5. 모든 게 성공했으면 DB에 분석 결과 저장 (UPSERT 덮어쓰기)
+                    import json
+                    logger.info(f"[분석 완료 - JSON 결과물]\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
+                    
+                    # 4. DB에 분석 결과 먼저 안전하게 덮어쓰기 (UPSERT)
                     await self._analysis_repository.save_analysis_result(
                         case_id=case_id, 
                         analyzer_version=1, 
                         mappings=analysis_result["mappings"]
                     )
+                    logger.info(f"[DB 저장 성공] case_id={case_id} 분석 결과 자체 DB 저장 완료")
+
+                    # 5. 마지막으로 Spring API 서버로 HTTP POST 전송 시도
+                    response = await http_client.post(self._spring_api_url, json=payload)
+                    response.raise_for_status() # 200번대 성공이 아니면 여기서 HTTPError 발생
+                    logger.info(f"[전송 성공] case_id={case_id} Spring API 전송 완료")
                     
                 except httpx.HTTPError as e:
                     logger.error(f"[HTTP 전송 실패] case_id={case_id} API 연동 중 오류 발생: {e}")
