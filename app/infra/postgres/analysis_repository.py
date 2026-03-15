@@ -43,6 +43,7 @@ class AnalysisRepository:
             return await conn.fetch(sql)
         
     # 분석 완료 후 분석 내역 및 매핑 결과를 DB에 바로 저장하는 쿼리
+    # UPSERT를 적용하여 수정(UPDATE)된 상담글의 재분석 결과 덮어쓰기 지원
     async def save_analysis_result(
         self, 
         case_id: int, 
@@ -50,20 +51,32 @@ class AnalysisRepository:
         mappings: list[dict]
     ) -> int:
         """
-        분석이 끝난 후 consultation_analysis와 매핑 결과를 DB에 INSERT
+        분석 완료 후 분석 내역과 매핑 결과를 DB에 저장
+        (고객이 글을 수정해 재분석된 경우 기존 데이터를 덮어씀)
         """
         async with self._pool.acquire() as conn:
             async with conn.transaction():
-                # 1. 분석 내역(consultation_analysis) 적재
+                # 1. UPSERT (분석 내역이 없으면 INSERT, 이미 있으면 updated_at만 갱신)
                 analysis_sql = """
                 INSERT INTO consultation_analysis 
                     (case_id, job_instance_id, analyzer_version)
                 VALUES ($1, 0, $2)
+                ON CONFLICT (case_id, analyzer_version) 
+                DO UPDATE SET updated_at = NOW()
                 RETURNING analysis_id
                 """
                 analysis_id = await conn.fetchval(analysis_sql, case_id, analyzer_version)
 
-                # 2. 키워드 매핑 결과 적재
+                # 2. 기존 키워드 매핑 결과 초기화 (싹 비우기)
+                # 고객이 글을 수정하면서 기존에 있던 키워드가 사라졌을 수도 있으므로,
+                # 옛날 분석 결과는 깔끔하게 삭제
+                delete_mapping_sql = """
+                DELETE FROM business_keyword_mapping_result 
+                WHERE analysis_id = $1
+                """
+                await conn.execute(delete_mapping_sql, analysis_id)
+
+                # 3. 새로운(또는 변경된) 키워드 매핑 결과 적재
                 if mappings:
                     mapping_sql = """
                     INSERT INTO business_keyword_mapping_result 
