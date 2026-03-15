@@ -1,111 +1,61 @@
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from app.schemas.analysis_request_message import AnalysisRequestMessage
-
-
 class AnalysisOutcomeService:
-    def __init__(self, result_limit: int) -> None:
+    def __init__(self, result_limit: int = 20) -> None:
         self._result_limit = max(1, result_limit)
 
-    def build_message_outcomes(
+    def build_http_outcome(
         self,
-        batch: list[AnalysisRequestMessage],
-        target_by_pair: dict[tuple[int, int], Any],
-        outbox_metadata_by_request_id: dict[str, dict[str, Any]],
-        mapping_rows: list[tuple[int, int, int]],
-        completed_ids: list[int],
-        failed_items: list[tuple[int, str]],
-        keyword_info_by_id: dict[int, dict[str, str]],
-    ) -> list[dict[str, Any]]:
-        failed_by_analysis_id = {int(analysis_id): error for analysis_id, error in failed_items}
-        completed_id_set = {int(analysis_id) for analysis_id in completed_ids}
+        case_id: int,
+        analyzer_version: int,
+        analysis_id: int | None,
+        member_id: int,
+        sentiment: str,
+        mappings: list[dict[str, Any]],
+        error_message: str | None = None
+    ) -> dict[str, Any]:
+        """
+        단건 상담 분석 결과를 Spring API 서버로 전송할 JSON 페이로드로 변환
+        """
         produced_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        status = "FAILED" if error_message else "COMPLETED"
+        
+        # HTTP 전송 멱등성을 위한 고유 요청 ID 생성 (예: req-1001-a1b2c3d4)
+        dispatch_request_id = f"req-{case_id}-{uuid.uuid4().hex[:8]}"
 
-        mapping_summary_by_analysis_id: dict[int, dict[str, int]] = {}
-        mapping_detail_by_analysis_id: dict[int, dict[int, int]] = {}
-        for analysis_id, _, count in mapping_rows:
-            key = int(analysis_id)
-            summary = mapping_summary_by_analysis_id.setdefault(
-                key,
-                {"keywordTypes": 0, "keywordHits": 0},
-            )
-            summary["keywordTypes"] += 1
-            summary["keywordHits"] += int(count)
+        # 통계 계산
+        keyword_types = len(mappings)
+        keyword_hits = sum(m.get("count", 0) for m in mappings)
 
-        for analysis_id, keyword_id, count in mapping_rows:
-            detail = mapping_detail_by_analysis_id.setdefault(int(analysis_id), {})
-            key = int(keyword_id)
-            detail[key] = detail.get(key, 0) + int(count)
+        # 출현 빈도(count)가 높은 순으로 정렬 후 최대 개수(result_limit) 제한
+        sorted_mappings = sorted(mappings, key=lambda x: -x.get("count", 0))[:self._result_limit]
 
-        outcomes: list[dict[str, Any]] = []
-        for message in batch:
-            pair = (message.case_id, message.analyzer_version)
-            target = target_by_pair.get(pair)
-            outbox_metadata = outbox_metadata_by_request_id.get(message.dispatch_request_id, {})
-            chunk_id = outbox_metadata.get("chunkId")
+        # 키워드 결과 조립 (negativeWeight 포함)
+        keyword_counts = []
+        for m in sorted_mappings:
+            keyword_counts.append({
+                "keywordId": m["businessKeywordId"],
+                "businessKeywordId": m["businessKeywordId"],
+                "keywordCode": m["keywordCode"],
+                "keywordName": m["keywordName"],
+                "count": m["count"],
+                "negativeWeight": m.get("negativeWeight", 0)
+            })
 
-            if target is None:
-                outcomes.append(
-                    {
-                        "type": "RESPONSE",
-                        "schema": "analysis.response.v1",
-                        "dispatchRequestId": message.dispatch_request_id,
-                        "chunkId": chunk_id,
-                        "caseId": message.case_id,
-                        "analyzerVersion": message.analyzer_version,
-                        "analysisId": None,
-                        "memberId": None,
-                        "status": "MISSING_TARGET",
-                        "keywordTypes": 0,
-                        "keywordHits": 0,
-                        "keywordCounts": [],
-                        "error": "target not found",
-                        "producedAt": produced_at,
-                    }
-                )
-                continue
-
-            analysis_id = int(target["analysis_id"])
-            member_id = int(target["member_id"])
-            summary = mapping_summary_by_analysis_id.get(analysis_id, {"keywordTypes": 0, "keywordHits": 0})
-            detail = mapping_detail_by_analysis_id.get(analysis_id, {})
-            error_message = failed_by_analysis_id.get(analysis_id)
-
-            if error_message is not None:
-                status = "FAILED"
-            elif analysis_id in completed_id_set:
-                status = "COMPLETED"
-            else:
-                status = "UNKNOWN"
-
-            keyword_counts = [
-                {
-                    "keywordId": keyword_id,
-                    "businessKeywordId": keyword_id,
-                    "keywordCode": keyword_info_by_id.get(keyword_id, {}).get("keywordCode", "-"),
-                    "keywordName": keyword_info_by_id.get(keyword_id, {}).get("keywordName", "-"),
-                    "count": count,
-                }
-                for keyword_id, count in sorted(detail.items(), key=lambda item: (-item[1], item[0]))[:self._result_limit]
-            ]
-            outcomes.append(
-                {
-                    "type": "RESPONSE",
-                    "schema": "analysis.response.v1",
-                    "dispatchRequestId": message.dispatch_request_id,
-                    "chunkId": chunk_id,
-                    "caseId": message.case_id,
-                    "analyzerVersion": message.analyzer_version,
-                    "analysisId": analysis_id,
-                    "memberId": member_id,
-                    "status": status,
-                    "keywordTypes": summary["keywordTypes"],
-                    "keywordHits": summary["keywordHits"],
-                    "keywordCounts": keyword_counts,
-                    "error": error_message,
-                    "producedAt": produced_at,
-                }
-            )
-
-        return outcomes
+        # 최종 HTTP POST용 JSON 딕셔너리
+        return {
+            "dispatchRequestId": dispatch_request_id,
+            "caseId": case_id,
+            "analyzerVersion": analyzer_version,
+            "analysisId": analysis_id,
+            "memberId": member_id,
+            "status": status,
+            "keywordTypes": keyword_types,
+            "keywordHits": keyword_hits,
+            "consultationType": sentiment,    
+            "keywordCounts": keyword_counts,
+            "error": error_message,
+            "producedAt": produced_at,
+        }
