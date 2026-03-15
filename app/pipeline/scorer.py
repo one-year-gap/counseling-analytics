@@ -157,7 +157,8 @@ class ContextScorer:
                 # print(f"  - 비교: '{noun_text}' vs '{dict_word}' -> Distance: {dist}")
 
                 # 거리 1 = 1글자만 틀린 오타
-                if dist == 1:
+                # [안전장치 추가] 2글자 이하의 단어는 오타 검사에서 제외 (3글자 이상만 허용)
+                if dist == 1 and len(dict_word) >= 3:
                     # print(f"[구출 성공!] '{noun_text}'는 '{dict_word}'의 오타입니다.")
                     rescued_results.append({
                         "keyword_id": label_ids[0],
