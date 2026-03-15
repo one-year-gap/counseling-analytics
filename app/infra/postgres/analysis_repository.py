@@ -62,8 +62,8 @@ class AnalysisRepository:
                 INSERT INTO consultation_analysis 
                     (case_id, job_instance_id, analyzer_version)
                 VALUES ($1, 0, $2)
-                ON CONFLICT (case_id, analyzer_version) 
-                DO UPDATE SET updated_at = NOW()
+                ON CONFLICT (case_id) 
+                DO UPDATE SET updated_at = NOW(), analyzer_version = EXCLUDED.analyzer_version
                 RETURNING analysis_id
                 """
                 analysis_id = await conn.fetchval(analysis_sql, case_id, analyzer_version)

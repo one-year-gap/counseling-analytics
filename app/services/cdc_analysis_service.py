@@ -102,11 +102,20 @@ class CdcAnalysisService:
                     # 2. 분석 파이프라인 돌리기 (KoELECTRA 감정 분석 + 키워드 추출)
                     analysis_result = self._analysis_service.analyze_single_target(target)
                     
-                    # 3. JSON 조립하기
+                    # 3. DB에 분석 결과 먼저 안전하게 덮어쓰기 (UPSERT)
+                    # 여기서 DB가 방금 생성한 analysis_id를 받아옴
+                    analysis_id = await self._analysis_repository.save_analysis_result(
+                        case_id=case_id, 
+                        analyzer_version=1, 
+                        mappings=analysis_result["mappings"]
+                    )
+                    logger.info(f"[DB 저장 성공] case_id={case_id} 자체 DB 저장 완료 (analysis_id={analysis_id})")
+
+                    # 4. JSON 조립하기
                     payload = self._outcome_service.build_http_outcome(
                         case_id=case_id,
                         analyzer_version=1,
-                        analysis_id=None,
+                        analysis_id=analysis_id, # null 대신 진짜 ID 주입
                         member_id=target["member_id"],
                         sentiment=analysis_result["sentiment"],
                         mappings=analysis_result["mappings"],
@@ -114,14 +123,6 @@ class CdcAnalysisService:
 
                     import json
                     logger.info(f"[분석 완료 - JSON 결과물]\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
-                    
-                    # 4. DB에 분석 결과 먼저 안전하게 덮어쓰기 (UPSERT)
-                    await self._analysis_repository.save_analysis_result(
-                        case_id=case_id, 
-                        analyzer_version=1, 
-                        mappings=analysis_result["mappings"]
-                    )
-                    logger.info(f"[DB 저장 성공] case_id={case_id} 분석 결과 자체 DB 저장 완료")
 
                     # 5. 마지막으로 Spring API 서버로 HTTP POST 전송 시도
                     response = await http_client.post(self._spring_api_url, json=payload)
