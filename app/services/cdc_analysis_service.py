@@ -121,8 +121,8 @@ class CdcAnalysisService:
                         mappings=analysis_result["mappings"],
                     )
 
-                    import json
-                    logger.info(f"[분석 완료 - JSON 결과물]\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
+                    # import json
+                    # logger.info(f"[분석 완료 - JSON 결과물]\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
 
                     # 5. 마지막으로 Spring API 서버로 HTTP POST 전송 시도
                     response = await http_client.post(self._spring_api_url, json=payload)
