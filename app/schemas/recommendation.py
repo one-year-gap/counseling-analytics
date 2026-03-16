@@ -25,7 +25,7 @@ class RecommendedProductItem(BaseModel):
     product_price: int = Field(..., serialization_alias="productPrice")
     sale_price: int = Field(..., serialization_alias="salePrice")
     tags: list[str] = Field(..., serialization_alias="tags")
-    llm_reason: str = Field(..., serialization_alias="llmReason")
+    llm_reason: str = Field(..., serialization_alias="reason")
 
     model_config = ConfigDict(serialize_by_alias=True)
 
