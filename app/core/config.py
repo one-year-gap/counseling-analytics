@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     kafka_heartbeat_interval_ms: int = Field(default=15000, validation_alias=AliasChoices("KAFKA_HEARTBEAT_INTERVAL_MS"))
 
     spring_api_url: str = Field(
-        default="http://admin-api.holliverse.internal:8081/api/v1/analysis-consultation", 
+        default="http://admin-api.holliverse.internal:8081/internal/v1/analysis-consultation", 
         validation_alias=AliasChoices("SPRING_API_URL")
     )
 
