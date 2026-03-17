@@ -94,6 +94,9 @@ EMBEDDING_DIMENSION = 1536
 # 데이터무제한 판별용 태그 (포함 여부로 검사)
 UNLIMITED_DATA_TAG_MARKER = "무제한"
 
+# product_type별 최대 추천 개수
+MAX_PRODUCTS_PER_TYPE = 2
+
 
 def _normalize_embedding_for_db(embedding: list[float]) -> list[float]:
     """
@@ -627,10 +630,10 @@ async def _run_recommendation_with_context(
         ctx.get("data_usage_pattern"),
     )
 
-    # product_type별로 후보 분산: 한 타입당 최대 1개, 최대 5개까지 사용
+    # product_type별로 후보 분산: 한 타입당 최대 MAX_PRODUCTS_PER_TYPE개, 최대 5개까지 사용
     products_ordered = _diversify_products_by_type(
         products_ordered,
-        max_per_type=2,
+        max_per_type=MAX_PRODUCTS_PER_TYPE,
         max_total=5,
     )
 
@@ -742,7 +745,7 @@ async def _run_recommendation_with_context(
     used_ids: set[int] = set()
     type_counts: dict[str, int] = {}
 
-    # 1차: LLM이 반환한 JSON을 최대한 존중하되, product_type별로 최대 2개만 허용
+    # 1차: LLM이 반환한 JSON을 최대한 존중하되, product_type별로 최대 MAX_PRODUCTS_PER_TYPE개만 허용
     for item in raw_list:
         pid = item.get("product_id")
         reason = (item.get("reason") or "").strip() or "고객님께 가장 적합한 상품을 추천드립니다!"
@@ -752,7 +755,7 @@ async def _run_recommendation_with_context(
         ptype = (p.get("product_type") or "").strip()
         tcode = ptype.upper()
         current = type_counts.get(tcode, 0)
-        if current >= 2:
+        if current >= MAX_PRODUCTS_PER_TYPE:
             continue
         tags = _normalize_tags(p.get("tags"))
         rank = len(recommended_products) + 1
@@ -783,7 +786,7 @@ async def _run_recommendation_with_context(
             ptype = (p.get("product_type") or "").strip()
             tcode = ptype.upper()
             current = type_counts.get(tcode, 0)
-            if current >= 2:
+            if current >= MAX_PRODUCTS_PER_TYPE:
                 continue
             tags = _normalize_tags(p.get("tags"))
             rank = len(recommended_products) + 1
@@ -918,11 +921,11 @@ async def _run_fallback_recommendation(
                 updated_at=_utc_now_iso(),
             )
 
-        # product_type별로 후보 분산: 한 타입당 최대 1개, 최대 top_k(기본 3) 또는 5개 중 작은 값까지만 사용
+        # product_type별로 후보 분산: 한 타입당 최대 MAX_PRODUCTS_PER_TYPE개, 최대 top_k(기본 3) 또는 5개 중 작은 값까지만 사용
         max_total = min(top_k, 5)
         products_ordered = _diversify_products_by_type(
             products_ordered,
-            max_per_type=2,
+            max_per_type=MAX_PRODUCTS_PER_TYPE,
             max_total=max_total,
         )
 
@@ -942,7 +945,7 @@ async def _run_fallback_recommendation(
             ptype = (p.get("product_type") or "").strip()
             tcode = ptype.upper()
             current = type_counts.get(tcode, 0)
-            if current >= 2:
+            if current >= MAX_PRODUCTS_PER_TYPE:
                 continue
             tags = _normalize_tags(p.get("tags"))
             rank = len(recommended_products) + 1
