@@ -5,14 +5,20 @@ WORKDIR /build
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/opt/venv/bin:${PATH}"
 
 COPY requirements.txt ./
 
-RUN apt-get update \
+RUN python -m venv /opt/venv \
+    && apt-get update \
     && apt-get install -y --no-install-recommends build-essential python3-dev \
-    && pip wheel --wheel-dir /wheels -r requirements.txt \
-    && rm -rf /var/lib/apt/lists/*
+    && pip install --upgrade pip \
+    && grep -v '^torch==' requirements.txt > requirements.runtime.txt \
+    && pip install --no-cache-dir -r requirements.runtime.txt \
+    && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.2.2 \
+    && python -m spacy download ko_core_news_sm \
+    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/*
 
 
 FROM python:3.11-slim AS runtime
@@ -23,17 +29,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    APP_MODE=realtime \
+    PATH="/opt/venv/bin:${PATH}" \
+    APP_MODE=server \
     APP_HOST=0.0.0.0 \
     APP_PORT=8000
 
 RUN addgroup --system appgroup \
     && adduser --system --ingroup appgroup --home /app appuser
 
-COPY --from=builder /wheels /wheels
-RUN pip install --no-cache-dir /wheels/* \
-    && python -m spacy download ko_core_news_sm \
-    && rm -rf /wheels
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
 
 COPY app ./app
 COPY scripts ./scripts
