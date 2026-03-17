@@ -141,6 +141,61 @@ def _normalize_embedding_for_db(embedding: list[float]) -> list[float]:
     return None
 
 
+def _age_from_ctx(ctx: dict) -> int | None:
+    """member_llm_context.age_group에서 대표 나이(10, 20, 30 ...)를 추출."""
+    raw = (ctx.get("age_group") or "").strip()
+    num_str = "".join(ch for ch in raw if ch.isdigit())
+    if not num_str:
+        return None
+    try:
+        return int(num_str)
+    except ValueError:
+        return None
+
+
+def _is_age_allowed_for_tags(ctx: dict, product: dict) -> bool:
+    """
+    연령 관련 태그와 age_group을 기준으로, 나이가 맞지 않는 상품은 추천 대상에서 제외한다.
+
+    태그 규칙:
+    - '키즈', '자녀보호'  : 30대 이상만 허용 (age >= 30)
+    - '청소년'            : 10대만 허용 (age == 10)
+    - '20대청년'         : 20대만 허용 (age == 20)
+    - '시니어', '복지혜택': 50대 이상만 허용 (age >= 50)
+    - '현역병사'          : 20대만 허용 (age == 20)
+
+    연령 태그가 전혀 없으면 True를 반환해 제한하지 않는다.
+    """
+    age = _age_from_ctx(ctx)
+    if age is None:
+        return True
+
+    tags = _normalize_tags(product.get("tags"))
+
+    has_kids_tags = any("키즈" in t or "자녀보호" in t for t in tags)
+    has_teen_tag = any("청소년" in t for t in tags)
+    has_young20_tag = any("20대청년" in t for t in tags)
+    has_senior_tags = any("시니어" in t or "복지혜택" in t for t in tags)
+    has_soldier_tag = any("현역병사" in t for t in tags)
+
+    if not (has_kids_tags or has_teen_tag or has_young20_tag or has_senior_tags or has_soldier_tag):
+        return True
+
+    # 하드 룰: 조건을 만족하지 않으면 추천하지 않음
+    if has_kids_tags and age < 30:
+        return False
+    if has_teen_tag and age != 10:
+        return False
+    if has_young20_tag and age != 20:
+        return False
+    if has_soldier_tag and age != 20:
+        return False
+    if has_senior_tags and age < 50:
+        return False
+
+    return True
+
+
 def _check_and_update_product_type_count(
     product: dict,
     type_counts: dict[str, int],
@@ -668,21 +723,42 @@ async def _run_recommendation_with_context(
         ctx.get("data_usage_pattern"),
     )
 
-    # product_type별로 후보 분산: 한 타입당 최대 MAX_PRODUCTS_PER_TYPE개, 최대 5개까지 사용
-    products_ordered = _diversify_products_by_type(
-        products_ordered,
-        max_per_type=MAX_PRODUCTS_PER_TYPE,
-        max_total=5,
-    )
+    # 1차: 연령 태그 조건 하드 필터 (나이대에 맞지 않는 상품은 완전히 제외)
+    base_candidates = [
+        p for p in products_ordered
+        if _is_age_allowed_for_tags(ctx, p)
+    ]
 
-    if not products_ordered:
+    if not base_candidates:
         return RecommendationResponse(
             segment=_segment_enum(ctx.get("segment")),
-            cached_llm_recommendation="조건에 맞는 추천 상품이 없습니다.",
+            cached_llm_recommendation=NO_MATCHED_MESSAGE,
             recommended_products=[],
             source="LIVE",
             updated_at=_utc_now_iso(),
         )
+
+    # 2차: 타입 분산 (소프트 룰) + 3개 보장
+    primary = _diversify_products_by_type(
+        base_candidates,
+        max_per_type=MAX_PRODUCTS_PER_TYPE,
+        max_total=5,
+    )
+
+    if len(primary) >= top_k:
+        products_ordered = primary[:top_k]
+    else:
+        used_ids = {p["product_id"] for p in primary}
+        extra: list[dict] = []
+        for p in base_candidates:
+            pid = p.get("product_id")
+            if pid in used_ids:
+                continue
+            extra.append(p)
+            used_ids.add(pid)
+            if len(primary) + len(extra) >= top_k:
+                break
+        products_ordered = (primary + extra)[:top_k]
 
     # 3) LLM 호출용 상품 포맷 정규화 (product_name 등 통일)
     for p in products_ordered:
