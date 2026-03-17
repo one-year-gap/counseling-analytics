@@ -22,7 +22,7 @@ class ExactMapper:
     def build_index(self, keyword_data_list: List[dict]):
         """
         [초기화 단계] 서버 시작 시 1회 실행
-        EFS에서 로드한 사전 데이터(JSONL)를 파싱하여 인덱스를 메모리에 적재
+        DB서 로드한 사전 데이터를 파싱하여 인덱스를 메모리에 적재
         """
         for item in keyword_data_list:
             # 공통 식별자인 정답 라벨 ID (예: 'BK-020') 추출

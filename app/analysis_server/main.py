@@ -1,15 +1,15 @@
-"""FastAPI entrypoint for the ephemeral analysis server."""
+"""FastAPI entrypoint for the ephemeral analysis server (CDC 기반)."""
 
 from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging
-from app.services.kafka_analysis_consumer_service import KafkaAnalysisConsumerService
+from app.services.cdc_analysis_service import CdcAnalysisService 
 
 settings = get_settings()
 configure_logging(settings.debug)
@@ -17,32 +17,27 @@ configure_logging(settings.debug)
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    consumer_service = KafkaAnalysisConsumerService(settings)
-    await consumer_service.start()
-    application.state.analysis_consumer_service = consumer_service
+    cdc_service = CdcAnalysisService(settings)
+    await cdc_service.start()
+    application.state.cdc_service = cdc_service
+    
     try:
         yield
     finally:
-        await consumer_service.stop()
+        await cdc_service.stop()
 
 
 def create_app() -> FastAPI:
+    # lifespan을 등록해서 FastAPI 서버와 CDC 데몬의 생명주기를 하나로 묶음
     application = FastAPI(title=f"{settings.app_name}-analysis-server", lifespan=lifespan)
 
     @application.get("/")
     async def root() -> dict[str, str]:
-        return {"app": settings.app_name, "mode": "analysis-server", "health": "/health", "ready": "/ready"}
+        return {"app": settings.app_name, "mode": "cdc-analysis-server", "health": "/health"}
 
     @application.get("/health")
-    async def health() -> dict[str, object]:
-        return application.state.analysis_consumer_service.health_payload()
-
-    @application.get("/ready")
-    async def ready() -> dict[str, object]:
-        payload = application.state.analysis_consumer_service.readiness_payload()
-        if payload["ready"]:
-            return payload
-        raise HTTPException(status_code=503, detail=payload)
+    async def health() -> dict[str, str]:
+        return {"status": "ok", "service": "cdc_analysis_service_running"}
 
     return application
 
