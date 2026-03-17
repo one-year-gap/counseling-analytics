@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.realtime.api.router import api_router
+from app.services.cdc_analysis_service import CdcAnalysisService
 
 settings = get_settings()
 configure_logging(settings.debug)
@@ -23,18 +25,38 @@ def _mask_database_url(url: str) -> str:
     return re.sub(r"(:[^:@]+)(@)", r":****\2", url, count=1)
 
 
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    runtime_settings = get_settings()
+    cdc_service = None
+
+    if runtime_settings.cdc_analysis_enabled:
+        cdc_service = CdcAnalysisService(runtime_settings)
+        await cdc_service.start()
+        application.state.cdc_service = cdc_service
+        logging.info("CDC analysis service enabled inside unified intelligence runtime.")
+
+    try:
+        yield
+    finally:
+        if cdc_service is not None:
+            await cdc_service.stop()
+
+
 def create_app() -> FastAPI:
-    application = FastAPI(title=settings.app_name)
+    application = FastAPI(title=settings.app_name, lifespan=lifespan)
     application.include_router(api_router, prefix=settings.api_v1_prefix)
 
     @application.on_event("startup")
     async def log_db_target() -> None:
-        url = get_settings().effective_database_url
+        runtime_settings = get_settings()
+        url = runtime_settings.effective_database_url
         logging.info("DB 연결 대상: %s", _mask_database_url(url))
+        logging.info("CDC analysis enabled: %s", runtime_settings.cdc_analysis_enabled)
 
     @application.get("/")
     async def root() -> dict[str, str]:
-        return {"app": settings.app_name, "docs": "/docs", "health": "/health"}
+        return {"app": settings.app_name, "mode": "intelligence-server", "docs": "/docs", "health": "/health"}
 
     @application.get("/health")
     async def health() -> dict[str, str]:

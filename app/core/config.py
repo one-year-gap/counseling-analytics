@@ -8,9 +8,10 @@ import os
 
 
 class Settings(BaseSettings):
-    app_name: str = "counseling-analytics"
+    app_name: str = "intelligence-server"
     app_env: str = "local"
     debug: bool = False
+    cdc_analysis_enabled: bool = False
 
     api_v1_prefix: str = "/api/v1"
     log_level: str = "INFO"

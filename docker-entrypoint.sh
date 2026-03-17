@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-APP_MODE="${APP_MODE:-realtime}"
+APP_MODE="${APP_MODE:-server}"
 APP_HOST="${APP_HOST:-0.0.0.0}"
 APP_PORT="${APP_PORT:-8000}"
 
@@ -39,14 +39,9 @@ run_bg_and_wait() {
   return "${status}"
 }
 
-run_realtime() {
-  echo "[entrypoint] APP_MODE=realtime -> starting recommendation server"
+run_server() {
+  echo "[entrypoint] APP_MODE=${APP_MODE} -> starting unified intelligence server"
   run_bg_and_wait uvicorn app.realtime.main:app --host "${APP_HOST}" --port "${APP_PORT}"
-}
-
-run_analysis_server() {
-  echo "[entrypoint] APP_MODE=analysis-server -> starting analysis server"
-  run_bg_and_wait uvicorn app.analysis_server.main:app --host "${APP_HOST}" --port "${APP_PORT}"
 }
 
 run_batch() {
@@ -56,17 +51,20 @@ run_batch() {
 }
 
 case "${APP_MODE}" in
+  server)
+    run_server
+    ;;
   realtime)
-    run_realtime
+    run_server
     ;;
   analysis-server)
-    run_analysis_server
+    run_server
     ;;
   batch)
     run_batch
     ;;
   *)
-    echo "[entrypoint] Unknown APP_MODE: ${APP_MODE} (allowed: realtime|analysis-server|batch)"
+    echo "[entrypoint] Unknown APP_MODE: ${APP_MODE} (allowed: server|realtime|analysis-server|batch)"
     exit 2
     ;;
 esac
