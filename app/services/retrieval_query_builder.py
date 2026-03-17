@@ -4,6 +4,38 @@ Phase 3: member_llm_context 한 행으로 retrieval용 쿼리 텍스트 생성.
 """
 
 
+TYPE_LABELS: dict[str, str] = {
+    "MOBILE_PLAN": "휴대폰 요금제",
+    "INTERNET": "인터넷 상품",
+    "IPTV": "IPTV 상품",
+    "TAB_WATCH_PLAN": "태블릿/워치 요금제",
+    "ADDON": "부가서비스",
+}
+
+
+def _infer_types_from_tag(tag: str) -> list[str]:
+    """
+    recent_viewed_tags_top_3의 태그에서 관련 product_type 후보를 추론.
+    태그 네이밍 규칙에 따라 간단한 룰 기반만 적용한다.
+    """
+    if not tag:
+        return []
+    t = str(tag).strip().upper()
+    result: list[str] = []
+    if "OTT" in t or "NETFLIX" in t or "DISNEY" in t:
+        result.extend(["INTERNET", "IPTV"])
+    if "WATCH" in t or "워치" in t or "탭" in t or "태블릿" in t:
+        result.append("TAB_WATCH_PLAN")
+    if "INTERNET" in t or "인터넷" in t or "와이파이" in t:
+        result.append("INTERNET")
+    if "IPTV" in t or "TV" in t or "티비" in t:
+        result.append("IPTV")
+    if "ADDON" in t or "부가" in t or "옵션" in t:
+        result.append("ADDON")
+    # 중복 제거
+    return sorted({x for x in result if x})
+
+
 def build_retrieval_query_text(ctx: dict) -> str:
     """
     고객 컨텍스트를 한 문장으로 이어서 임베딩용 쿼리 텍스트 생성.
@@ -63,4 +95,32 @@ def build_retrieval_query_text(ctx: dict) -> str:
     if recent_counseling:
         parts.append(f"최근 상담: {recent_counseling}")
 
-    return " ".join(parts).strip() or "통신 요금제, 부가서비스 추천"
+    # product_type 관심도 기반으로, 쿼리 텍스트에 다양한 상품 유형을 명시적으로 포함
+    interest_types: set[str] = set()
+
+    # 1) current_product_types: true인 타입
+    if isinstance(current_types, dict):
+        for ptype, val in current_types.items():
+            if val:
+                interest_types.add(str(ptype).strip().upper())
+
+    # 2) product_type_clicks: 클릭이 있는 타입
+    if isinstance(product_type_clicks, dict):
+        for ptype, cnt in product_type_clicks.items():
+            if cnt is not None:
+                interest_types.add(str(ptype).strip().upper())
+
+    # 3) recent_viewed_tags_top_3: 태그 → 타입 매핑
+    if isinstance(recent_tags, list):
+        for tag in recent_tags[:3]:
+            for tcode in _infer_types_from_tag(tag):
+                interest_types.add(tcode)
+
+    labels = [TYPE_LABELS[t] for t in sorted(interest_types) if t in TYPE_LABELS]
+    if labels:
+        labels_str = ", ".join(labels)
+        parts.append(
+            f"특히 {labels_str} 중에서 고객에게 어울리는 다양한 상품 유형을 함께 고려해 주세요."
+        )
+
+    return " ".join(parts).strip() or "통신 요금제, 인터넷·IPTV, 부가서비스 추천"
