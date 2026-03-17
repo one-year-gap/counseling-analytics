@@ -1,6 +1,6 @@
 """Backward-compatible entrypoint.
 
-Prefer `app.realtime.main` for the realtime API server.
+Prefer `app.realtime.main` for the unified intelligence server.
 """
 
 from app.realtime.main import app, run

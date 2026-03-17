@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
+from app.infra.kafka.client_options import build_kafka_client_options
 from app.schemas.recommendation import (
     RecommendedProductItem,
     RecommendationResponse,
@@ -1137,8 +1138,8 @@ async def publish_recommendation_to_kafka(
         return
     payload = {"memberId": member_id, **response.model_dump(by_alias=True)}
     producer = AIOKafkaProducer(
-        bootstrap_servers=[s.strip() for s in bootstrap.split(",") if s.strip()],
         value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+        **build_kafka_client_options(settings),
     )
     try:
         await producer.start()

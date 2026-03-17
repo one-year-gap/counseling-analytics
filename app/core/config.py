@@ -8,9 +8,10 @@ import os
 
 
 class Settings(BaseSettings):
-    app_name: str = "counseling-analytics"
+    app_name: str = "intelligence-server"
     app_env: str = "local"
     debug: bool = False
+    cdc_analysis_enabled: bool = False
 
     api_v1_prefix: str = "/api/v1"
     log_level: str = "INFO"
@@ -31,10 +32,13 @@ class Settings(BaseSettings):
 
     # Kafka consumer (analysis request)
     kafka_consumer_enabled: bool = False
-    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_bootstrap_servers: str = Field(
+        default="",
+        validation_alias=AliasChoices("KAFKA_BOOTSTRAP_SERVERS", "MSK_BOOTSTRAP_SERVERS"),
+    )
     # kafka_analysis_request_topic: str = "analysis.request.v1"
     kafka_recommendation_topic: str = Field(
-        default="recommendation",
+        default="recommendation-topic",
         validation_alias=AliasChoices("KAFKA_RECOMMENDATION_TOPIC", "RECOMMENDATION_TOPIC"),
     )
     # kafka_analysis_response_topic: str = "analysis.response.v1"
