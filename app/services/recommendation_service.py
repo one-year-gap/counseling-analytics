@@ -82,7 +82,7 @@ WHERE p.product_id IN :ids
 """).bindparams(bindparam("ids", expanding=True))
 
 # retrieval 후보 수 (LLM에 넣은 뒤 3개 선택)
-RETRIEVAL_CANDIDATES_K = 7
+RETRIEVAL_CANDIDATES_K = 50
 
 # member_llm_context 미구축 시 사용할 기본 쿼리 텍스트
 DEFAULT_RETRIEVAL_QUERY = "통신 요금제, 데이터 요금제, 부가서비스 추천"
@@ -172,6 +172,40 @@ def _reorder_by_data_usage_pattern(
             return (rank, amount_val)
 
     return sorted(products, key=sort_key)
+
+
+def _diversify_products_by_type(
+    products: list[dict],
+    max_per_type: int = 1,
+    max_total: int | None = None,
+) -> list[dict]:
+    """
+    product_type별로 후보를 분산시켜 타입 편향을 완화한다.
+    - max_per_type: 한 타입(product_type)당 최대 몇 개까지 포함할지 (기본 1개).
+    - max_total: 전체 최대 개수. None이면 제한 없음.
+    """
+    if not products:
+        return products
+
+    type_counts: dict[str, int] = {}
+    diversified: list[dict] = []
+
+    for p in products:
+        ptype = (p.get("product_type") or "").strip()
+        key = ptype.upper()
+        current = type_counts.get(key, 0)
+        if max_per_type is not None and current >= max_per_type:
+            continue
+
+        diversified.append(p)
+        type_counts[key] = current + 1
+
+        if max_total is not None and len(diversified) >= max_total:
+            break
+
+    # 모든 타입이 이미 한 번씩 포함될 수 없을 만큼 후보가 한쪽에 치우친 경우,
+    # 최소 1개라도 유지하기 위해 비어 있지 않으면 그대로 반환한다.
+    return diversified or products
 
 
 def _normalize_tags(tags: list | str | None) -> list[str]:
@@ -331,34 +365,133 @@ def _segment_enum(segment: str | None) -> Segment:
     return Segment.normal
 
 
-def _product_type_boost_from_ctx(ctx: dict) -> tuple[str, float, str, float]:
+SEGMENT_WEIGHT_CONFIG: dict[str, dict[str, float]] = {
+    "CHURN_RISK": {
+        "current_type": 1.5,
+        "click": 0.7,
+        "tag": 0.5,
+    },
+    "UPSELL": {
+        "current_type": 1.0,
+        "click": 1.5,
+        "tag": 1.2,
+    },
+    "NORMAL": {
+        "current_type": 0.8,
+        "click": 1.3,
+        "tag": 1.3,
+    },
+}
+
+
+def _segment_key_from_ctx(ctx: dict) -> str:
+    seg = (ctx.get("segment") or "NORMAL").strip().upper()
+    if seg not in SEGMENT_WEIGHT_CONFIG:
+        seg = "NORMAL"
+    return seg
+
+
+def _infer_product_types_from_tag(tag: str) -> list[str]:
     """
-    member_llm_context.product_type_clicks 상위 2개 타입에 대한 (type1, bonus1, type2, bonus2).
-    bonus는 거리에서 빼서 해당 타입 순위 상승. 없으면 ("", 0.0, "", 0.0).
+    recent_viewed_tags_top_3의 태그를 product_type 힌트로 변환.
+    태그 네이밍 규칙에 따라 간단한 룰 기반 매핑만 적용하고, 나머지는 빈 리스트 반환.
     """
+    if not tag:
+        return []
+    t = str(tag).strip().upper()
+    related: list[str] = []
+    if "OTT" in t or "NETFLIX" in t or "DISNEY" in t or "WATCH" in t:
+        related.extend(["INTERNET", "IPTV"])
+    if "FAMILY" in t or "가족" in t:
+        related.extend(["INTERNET", "MOBILE_PLAN"])
+    if "SECURITY" in t or "보안" in t or "안심" in t:
+        related.append("SECURITY_ADDON")
+    if "KIDS" in t or "자녀" in t:
+        related.append("KIDS_ADDON")
+    # 중복 제거
+    return sorted({x for x in related if x})
+
+
+def compute_product_type_weights(ctx: dict) -> dict[str, float]:
+    """
+    member_llm_context 기반 product_type 가중치 맵 계산.
+    - current_product_types (true인 타입)
+    - product_type_clicks
+    - recent_viewed_tags_top_3 (태그 → 타입 매핑)
+    를 세그먼트별 비율에 따라 합산한다.
+    """
+    weights: dict[str, float] = {}
+    seg = _segment_key_from_ctx(ctx)
+    cfg = SEGMENT_WEIGHT_CONFIG.get(seg, SEGMENT_WEIGHT_CONFIG["NORMAL"])
+
+    current_types = ctx.get("current_product_types")
+    if isinstance(current_types, dict):
+        for ptype, val in current_types.items():
+            if val:
+                key = (str(ptype) or "").strip().upper()
+                if not key:
+                    continue
+                w = cfg.get("current_type", 1.0)
+                weights[key] = weights.get(key, 0.0) + w
+
     clicks = ctx.get("product_type_clicks")
-    if not isinstance(clicks, dict) or not clicks:
+    if isinstance(clicks, dict) and clicks:
+        items: list[tuple[str, int]] = []
+        for ptype, c in clicks.items():
+            if c is None:
+                continue
+            try:
+                count = int(c)
+            except (TypeError, ValueError):
+                continue
+            key = (str(ptype) or "").strip().upper()
+            if not key:
+                continue
+            items.append((key, count))
+        total_clicks = sum(c for _, c in items)
+        if total_clicks > 0:
+            click_weight = cfg.get("click", 1.0)
+            for key, count in items:
+                share = count / total_clicks
+                w = click_weight * share
+                weights[key] = weights.get(key, 0.0) + w
+
+    recent_tags = ctx.get("recent_viewed_tags_top_3")
+    if isinstance(recent_tags, list) and recent_tags:
+        tag_weight = cfg.get("tag", 1.0)
+        for raw_tag in recent_tags[:3]:
+            for key in _infer_product_types_from_tag(str(raw_tag or "")):
+                weights[key] = weights.get(key, 0.0) + tag_weight
+
+    return weights
+
+
+def _product_type_boost_from_weights(weights: dict[str, float]) -> tuple[str, float, str, float]:
+    """
+    product_type_weights에서 상위 2개 타입을 뽑아 SQL boost에 쓸 보너스를 계산한다.
+    """
+    if not weights:
         return ("", 0.0, "", 0.0)
-    try:
-        items = [(str(k).strip(), int(v)) for k, v in clicks.items() if v is not None and str(k).strip()]
-        items.sort(key=lambda x: x[1], reverse=True)
-        top2 = items[:2]
-        if not top2:
-            return ("", 0.0, "", 0.0)
-        total = sum(c for _, c in top2)
-        if total <= 0:
-            return ("", 0.0, "", 0.0)
-        # 최소 1개 타입은 있다고 가정. 두 번째 타입이 없으면 첫 번째 타입을 재사용하되 보너스는 0으로 둔다.
-        if len(top2) >= 2:
-            (t1, c1), (t2, c2) = top2[0], top2[1]
-        else:
-            (t1, c1) = top2[0]
-            t2, c2 = t1, 0
-        b1 = 0.15 * (c1 / total) if total > 0 else 0.0
-        b2 = 0.08 * (c2 / total) if (total > 0 and c2 > 0) else 0.0
-        return (t1, b1, t2, b2)
-    except Exception:
+    items = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)
+    t1, w1 = items[0]
+    if len(items) >= 2:
+        t2, w2 = items[1]
+    else:
+        t2, w2 = t1, 0.0
+
+    boost_scale_1 = 0.2
+    boost_scale_2 = 0.1
+
+    boost1 = boost_scale_1 * w1 if w1 > 0 else 0.0
+    boost2 = boost_scale_2 * w2 if w2 > 0 else 0.0
+
+    t1 = (t1 or "").strip()
+    t2 = (t2 or "").strip()
+    if not t1 and not t2:
         return ("", 0.0, "", 0.0)
+    if t1 and not t2:
+        t2, boost2 = t1, 0.0
+    return (t1, boost1, t2, boost2)
 
 
 async def _run_recommendation_with_context(
@@ -420,8 +553,9 @@ async def _run_recommendation_with_context(
     if query_vec is None:
         return None
 
-    # 2) pgvector 유사도 검색 (product_type_clicks 기반 가중치 포함)
-    boost_type1, boost1, boost_type2, boost2 = _product_type_boost_from_ctx(ctx)
+    # 2) pgvector 유사도 검색 (member_llm_context 기반 product_type 가중치 포함)
+    product_type_weights = compute_product_type_weights(ctx)
+    boost_type1, boost1, boost_type2, boost2 = _product_type_boost_from_weights(product_type_weights)
     use_type_boost = (boost1 > 0 or boost2 > 0)
     if use_type_boost:
         result = await session.execute(
@@ -462,10 +596,17 @@ async def _run_recommendation_with_context(
         r = dict(row)
         id_to_row[r["product_id"]] = r
     products_ordered = [id_to_row[pid] for pid in product_ids if pid in id_to_row]
+
+    # 디버깅: 벡터 검색 직후 product_type 분포 확인
+    type_counts: dict[str, int] = {}
+    for p in products_ordered:
+        ptype = (p.get("product_type") or "").strip().upper()
+        type_counts[ptype] = type_counts.get(ptype, 0) + 1
     logger.info(
-        "recommendation: ctx retrieval 완료 member_id=%s 후보=%d",
+        "recommendation: ctx retrieval 완료 member_id=%s 후보=%d type_dist=%s",
         member_id,
         len(products_ordered),
+        type_counts,
     )
 
     # CHURN_RISK: 동일 product_type 내에서만 가격 비교. 현재 해당 타입 보유 시 그 타입 현재 최고가 * 1.1 초과 상품 제외.
@@ -484,6 +625,13 @@ async def _run_recommendation_with_context(
     products_ordered = _reorder_by_data_usage_pattern(
         products_ordered,
         ctx.get("data_usage_pattern"),
+    )
+
+    # product_type별로 후보 분산: 한 타입당 최대 1개, 최대 3개까지 사용 (LLM 입력 후보 3개)
+    products_ordered = _diversify_products_by_type(
+        products_ordered,
+        max_per_type=2,
+        max_total=5,
     )
 
     if not products_ordered:
@@ -582,26 +730,69 @@ async def _run_recommendation_with_context(
         ]
         cached = "고객님의 이용 패턴과 관심사를 반영한 요금제·부가서비스 추천입니다."
 
-    recommended_products = []
-    for rank, item in enumerate(raw_list[:top_k], 1):
+    recommended_products: list[RecommendedProductItem] = []
+    mobile_count = 0
+    used_ids: set[int] = set()
+
+    # 1차: LLM이 반환한 JSON을 최대한 존중하되, MOBILE_PLAN은 최대 2개로 제한
+    for item in raw_list:
         pid = item.get("product_id")
         reason = (item.get("reason") or "").strip() or "고객님께 적합한 상품입니다."
         if pid not in id_to_row:
             continue
         p = id_to_row[pid]
+        ptype = (p.get("product_type") or "").strip()
+        if ptype.upper() == "MOBILE_PLAN":
+            if mobile_count >= 2:
+                continue
+            mobile_count += 1
         tags = _normalize_tags(p.get("tags"))
+        rank = len(recommended_products) + 1
+        if rank > top_k:
+            break
         recommended_products.append(
             RecommendedProductItem(
                 rank=rank,
                 product_id=p["product_id"],
                 product_name=(p.get("name") or "").strip(),
-                product_type=(p.get("product_type") or "").strip(),
+                product_type=ptype,
                 product_price=int(p.get("price") or 0),
                 sale_price=int(p.get("sale_price") or p.get("price") or 0),
                 tags=tags,
                 llm_reason=reason,
             )
         )
+        used_ids.add(p["product_id"])
+
+    # 2차: LLM이 충분한 개수를 채우지 못했거나 잘못된 product_id를 준 경우,
+    # diversification된 후보 목록(products_ordered)에서 남는 슬롯을 채운다.
+    if len(recommended_products) < top_k:
+        for p in products_ordered:
+            pid = p.get("product_id")
+            if pid in used_ids:
+                continue
+            ptype = (p.get("product_type") or "").strip()
+            if ptype.upper() == "MOBILE_PLAN":
+                if mobile_count >= 2:
+                    continue
+                mobile_count += 1
+            tags = _normalize_tags(p.get("tags"))
+            rank = len(recommended_products) + 1
+            if rank > top_k:
+                break
+            recommended_products.append(
+                RecommendedProductItem(
+                    rank=rank,
+                    product_id=pid,
+                    product_name=(p.get("name") or "").strip(),
+                    product_type=ptype,
+                    product_price=int(p.get("price") or 0),
+                    sale_price=int(p.get("sale_price") or p.get("price") or 0),
+                    tags=tags,
+                    llm_reason="고객님께 적합한 상품입니다.",
+                )
+            )
+            used_ids.add(pid)
 
     return RecommendationResponse(
         segment=_segment_enum(ctx.get("segment")),
@@ -696,6 +887,18 @@ async def _run_fallback_recommendation(
             r = dict(row)
             id_to_row[r["product_id"]] = r
         products_ordered = [id_to_row[pid] for pid in product_ids if pid in id_to_row]
+
+        # 디버깅: 폴백 벡터 검색 직후 product_type 분포 확인
+        fb_type_counts: dict[str, int] = {}
+        for p in products_ordered:
+            ptype = (p.get("product_type") or "").strip().upper()
+            fb_type_counts[ptype] = fb_type_counts.get(ptype, 0) + 1
+        logger.info(
+            "recommendation: fallback retrieval 완료 후보=%d type_dist=%s",
+            len(products_ordered),
+            fb_type_counts,
+        )
+
         if not products_ordered:
             return RecommendationResponse(
                 segment=Segment.normal,
@@ -704,6 +907,14 @@ async def _run_fallback_recommendation(
                 source="LIVE",
                 updated_at=_utc_now_iso(),
             )
+
+        # product_type별로 후보 분산: 한 타입당 최대 1개, 최대 top_k(기본 3) 또는 5개 중 작은 값까지만 사용
+        max_total = min(top_k, 5)
+        products_ordered = _diversify_products_by_type(
+            products_ordered,
+            max_per_type=2,
+            max_total=max_total,
+        )
 
         summaries = [
             f"{p.get('name') or ''} (product_id={p.get('product_id')})"
@@ -715,19 +926,28 @@ async def _run_fallback_recommendation(
             settings.openai_chat_model,
             summaries,
         )
-        recommended_products = []
-        for i, p in enumerate(products_ordered):
+        recommended_products: list[RecommendedProductItem] = []
+        mobile_count = 0
+        for p in products_ordered:
+            ptype = (p.get("product_type") or "").strip()
+            if ptype.upper() == "MOBILE_PLAN":
+                if mobile_count >= 2:
+                    continue
+                mobile_count += 1
             tags = _normalize_tags(p.get("tags"))
+            rank = len(recommended_products) + 1
+            if rank > top_k:
+                break
             recommended_products.append(
                 RecommendedProductItem(
-                    rank=i + 1,
+                    rank=rank,
                     product_id=p["product_id"],
                     product_name=(p.get("name") or "").strip(),
-                    product_type=(p.get("product_type") or "").strip(),
+                    product_type=ptype,
                     product_price=int(p.get("price") or 0),
                     sale_price=int(p.get("sale_price") or p.get("price") or 0),
                     tags=tags,
-                    llm_reason=reasons[i] if i < len(reasons) else "고객님께 적합한 상품입니다.",
+                    llm_reason=reasons[rank - 1] if rank - 1 < len(reasons) else "고객님께 적합한 상품입니다.",
                 )
             )
         return RecommendationResponse(
