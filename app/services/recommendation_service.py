@@ -81,6 +81,17 @@ LEFT JOIN tab_watch_plan tw ON p.product_id = tw.product_id
 WHERE p.product_id IN :ids
 """).bindparams(bindparam("ids", expanding=True))
 
+# 기본 추천용: 임베딩/컨텍스트 없이 사용할 상품 목록 (간단 정렬 기준)
+FETCH_DEFAULT_PRODUCTS_SQL = text("""
+SELECT
+    p.product_id, p.name, p.product_type, p.price, p.sale_price, p.tags, p.embedding_text,
+    NULL::integer AS data_amount
+FROM product p
+WHERE p.embedding_text IS NOT NULL
+ORDER BY p.product_id
+LIMIT :k
+""")
+
 # retrieval 후보 수 (LLM에 넣은 뒤 3개 선택)
 RETRIEVAL_CANDIDATES_K = 50
 
@@ -93,6 +104,16 @@ EMBEDDING_DIMENSION = 1536
 
 # 데이터무제한 판별용 태그 (포함 여부로 검사)
 UNLIMITED_DATA_TAG_MARKER = "무제한"
+
+# product_type별 최대 추천 개수
+MAX_PRODUCTS_PER_TYPE = 2
+
+# LLM 기본 reason 및 메시지 상수
+DEFAULT_PRODUCT_REASON_TEXT = "고객님께 가장 적합한 상품을 추천드립니다!"
+NO_CANDIDATE_MESSAGE = "추천할 수 있는 상품이 없습니다."
+NO_MATCHED_MESSAGE = "조건에 맞는 추천 상품이 없습니다."
+FALLBACK_CACHED_MESSAGE = "고객님의 이용 패턴과 관심사를 반영한 요금제·부가서비스 추천입니다."
+FALLBACK_VECTOR_SUMMARY = "고객님께 어울리는 상품을 추천해드릴게요!"
 
 
 def _normalize_embedding_for_db(embedding: list[float]) -> list[float]:
@@ -118,6 +139,26 @@ def _normalize_embedding_for_db(embedding: list[float]) -> list[float]:
         EMBEDDING_DIMENSION,
     )
     return None
+
+
+def _check_and_update_product_type_count(
+    product: dict,
+    type_counts: dict[str, int],
+    max_per_type: int,
+) -> bool:
+    """
+    상품 유형별 개수를 확인하고, 제한에 걸리지 않으면 개수를 업데이트한 뒤 True를 반환한다.
+    제한을 초과하면 False를 반환한다.
+    """
+    ptype = (product.get("product_type") or "").strip()
+    tcode = ptype.upper()
+    if not tcode:
+        return True
+    current = type_counts.get(tcode, 0)
+    if current >= max_per_type:
+        return False
+    type_counts[tcode] = current + 1
+    return True
 
 
 def _embedding_to_vector_str(embedding: list[float]) -> str:
@@ -627,10 +668,10 @@ async def _run_recommendation_with_context(
         ctx.get("data_usage_pattern"),
     )
 
-    # product_type별로 후보 분산: 한 타입당 최대 1개, 최대 3개까지 사용 (LLM 입력 후보 3개)
+    # product_type별로 후보 분산: 한 타입당 최대 MAX_PRODUCTS_PER_TYPE개, 최대 5개까지 사용
     products_ordered = _diversify_products_by_type(
         products_ordered,
-        max_per_type=2,
+        max_per_type=MAX_PRODUCTS_PER_TYPE,
         max_total=5,
     )
 
@@ -657,12 +698,20 @@ async def _run_recommendation_with_context(
     user_prompt = build_user_prompt(ctx, products_text)
 
     json_instruction = (
-        "응답은 반드시 다음 JSON 형식만 출력하세요. 다른 말 없이 JSON만.\n"
+        "응답은 반드시 아래 JSON 형식만 출력해 줄 거예요. 다른 말은 쓰지 말고 JSON만 보내 주세요.\n"
         "{"
-        "\"cached_llm_recommendation\": \"전체 추천을 대표하는 전반적인 마케팅 문구를 2~4문장으로 작성하세요. "
-        "고객의 세그먼트, 페르소나, 최근 상담 및 이용 패턴을 요약하고, 이번에 제안하는 상품 조합의 핵심 혜택과 가치를 자연스러운 카피 톤으로 설명하세요.\", "
+        "\"cached_llm_recommendation\": \"전체 추천을 대표하는 전반적인 마케팅 문구를 2~4문장으로 써 줄 거예요. "
+        "고객의 세그먼트, 페르소나, 최근 상담 및 이용 패턴을 부드럽게 요약해 주고, 이번에 제안하는 상품 조합의 핵심 혜택과 가치를 자연스러운 카피 톤으로 설명해 주세요.\", "
         "\"recommended_products\": ["
-        "{\"product_id\": 숫자, \"reason\": \"각 상품별로 2~3문장으로, 왜 이 고객에게 이 상품이 적합한지 구체적으로 설명하세요.\"}, ..."
+        "{"
+        "\"product_id\": 숫자, "
+        "\"reason\": \"각 상품별로 2~3문장으로 써 줄 거예요. "
+        "반드시 (1) 현재 고객이 이용 중인 요금제/상품/지출 수준이나 사용 패턴과 비교해서, "
+        "가격이나 혜택 측면에서 뭐가 어떻게 더 좋아지는지 한 문장 이상으로 구체적으로 설명해 주세요. "
+        "(2) 고객의 데이터 사용 패턴, 가족 구성, 최근 상담 내용, 최근 조회 태그, segment, persona 등 컨텍스트 중에서 최소 한 가지는 문장 안에 꼭 넣어 줄 거예요. "
+        "단순히 '다양한 혜택을 제공합니다', '고객님께 적합한 상품입니다', '안정성과 편의를 모두 고려한 선택입니다'처럼 누구에게나 쓸 수 있는 추상적인 카탈로그 문구만 쓰는 건 피해 주세요. "
+        "상품 스펙(속도, 채널 수, 기본 기능 등)을 다시 나열하기보다는, 지금 고객 입장에서 무엇이 어떻게 달라지는지를 중심으로 reason을 써 주면 좋아요.\""
+        "}, ..."
         "]"
         "}"
     )
@@ -711,7 +760,7 @@ async def _run_recommendation_with_context(
         )
         # 폴백: 상위 3개에 기본 reason
         raw_list = [
-            {"product_id": p["product_id"], "reason": "고객님께 적합한 상품입니다."}
+            {"product_id": p["product_id"], "reason": "고객님께 가장 적합한 상품을 추천드립니다!"}
             for p in products_ordered[:top_k]
         ]
         cached = "고객님의 이용 패턴과 관심사를 반영한 요금제·부가서비스 추천입니다."
@@ -725,27 +774,25 @@ async def _run_recommendation_with_context(
             exc_info=True,
         )
         raw_list = [
-            {"product_id": p["product_id"], "reason": "고객님께 적합한 상품입니다."}
+            {"product_id": p["product_id"], "reason": "고객님께 가장 적합한 상품을 추천드립니다!"}
             for p in products_ordered[:top_k]
         ]
         cached = "고객님의 이용 패턴과 관심사를 반영한 요금제·부가서비스 추천입니다."
 
     recommended_products: list[RecommendedProductItem] = []
-    mobile_count = 0
     used_ids: set[int] = set()
+    type_counts: dict[str, int] = {}
 
-    # 1차: LLM이 반환한 JSON을 최대한 존중하되, MOBILE_PLAN은 최대 2개로 제한
+    # 1차: LLM이 반환한 JSON을 최대한 존중하되, product_type별로 최대 MAX_PRODUCTS_PER_TYPE개만 허용
     for item in raw_list:
         pid = item.get("product_id")
-        reason = (item.get("reason") or "").strip() or "고객님께 적합한 상품입니다."
+        reason = (item.get("reason") or "").strip() or "고객님께 가장 적합한 상품을 추천드립니다!"
         if pid not in id_to_row:
             continue
         p = id_to_row[pid]
+        if not _check_and_update_product_type_count(p, type_counts, MAX_PRODUCTS_PER_TYPE):
+            continue
         ptype = (p.get("product_type") or "").strip()
-        if ptype.upper() == "MOBILE_PLAN":
-            if mobile_count >= 2:
-                continue
-            mobile_count += 1
         tags = _normalize_tags(p.get("tags"))
         rank = len(recommended_products) + 1
         if rank > top_k:
@@ -771,11 +818,9 @@ async def _run_recommendation_with_context(
             pid = p.get("product_id")
             if pid in used_ids:
                 continue
+            if not _check_and_update_product_type_count(p, type_counts, MAX_PRODUCTS_PER_TYPE):
+                continue
             ptype = (p.get("product_type") or "").strip()
-            if ptype.upper() == "MOBILE_PLAN":
-                if mobile_count >= 2:
-                    continue
-                mobile_count += 1
             tags = _normalize_tags(p.get("tags"))
             rank = len(recommended_products) + 1
             if rank > top_k:
@@ -789,10 +834,11 @@ async def _run_recommendation_with_context(
                     product_price=int(p.get("price") or 0),
                     sale_price=int(p.get("sale_price") or p.get("price") or 0),
                     tags=tags,
-                    llm_reason="고객님께 적합한 상품입니다.",
+                    llm_reason="고객님께 가장 적합한 상품을 추천드립니다!",
                 )
             )
             used_ids.add(pid)
+            type_counts[tcode] = current + 1
 
     return RecommendationResponse(
         segment=_segment_enum(ctx.get("segment")),
@@ -838,16 +884,52 @@ async def _run_fallback_recommendation(
             )
         except Exception as e:
             logger.warning(
-                "OpenAI 임베딩 실패 (폴백): model=%s error_type=%s error=%s",
+                "OpenAI 임베딩 실패 (폴백, 기본 상품으로 대체): model=%s error_type=%s error=%s",
                 emb_model,
                 type(e).__name__,
                 e,
                 exc_info=True,
             )
+            # 임베딩 실패 시: 임의 기본 상품 목록으로 간단 추천 제공
+            default_result = await fallback_session.execute(
+                FETCH_DEFAULT_PRODUCTS_SQL,
+                {"k": top_k},
+            )
+            rows = list(default_result.mappings())
+            if not rows:
+                return RecommendationResponse(
+                    segment=Segment.normal,
+                    cached_llm_recommendation=NO_CANDIDATE_MESSAGE,
+                    recommended_products=[],
+                    source="LIVE",
+                    updated_at=_utc_now_iso(),
+                )
+            recommended_products: list[RecommendedProductItem] = []
+            type_counts: dict[str, int] = {}
+            for i, row in enumerate(rows):
+                p = dict(row)
+                if not _check_and_update_product_type_count(p, type_counts, MAX_PRODUCTS_PER_TYPE):
+                    continue
+                tags = _normalize_tags(p.get("tags"))
+                rank = len(recommended_products) + 1
+                if rank > top_k:
+                    break
+                recommended_products.append(
+                    RecommendedProductItem(
+                        rank=rank,
+                        product_id=p["product_id"],
+                        product_name=(p.get("name") or "").strip(),
+                        product_type=(p.get("product_type") or "").strip(),
+                        product_price=int(p.get("price") or 0),
+                        sale_price=int(p.get("sale_price") or p.get("price") or 0),
+                        tags=tags,
+                        llm_reason=DEFAULT_PRODUCT_REASON_TEXT,
+                    )
+                )
             return RecommendationResponse(
                 segment=Segment.normal,
-                cached_llm_recommendation="[일시 오류] 추천을 생성하지 못했습니다.",
-                recommended_products=[],
+                cached_llm_recommendation="아직 추천을 생성할만한 정보가 없어요. 대신 이 상품은 어떠세요?",
+                recommended_products=recommended_products,
                 source="LIVE",
                 updated_at=_utc_now_iso(),
             )
@@ -908,11 +990,11 @@ async def _run_fallback_recommendation(
                 updated_at=_utc_now_iso(),
             )
 
-        # product_type별로 후보 분산: 한 타입당 최대 1개, 최대 top_k(기본 3) 또는 5개 중 작은 값까지만 사용
+        # product_type별로 후보 분산: 한 타입당 최대 MAX_PRODUCTS_PER_TYPE개, 최대 top_k(기본 3) 또는 5개 중 작은 값까지만 사용
         max_total = min(top_k, 5)
         products_ordered = _diversify_products_by_type(
             products_ordered,
-            max_per_type=2,
+            max_per_type=MAX_PRODUCTS_PER_TYPE,
             max_total=max_total,
         )
 
@@ -927,13 +1009,11 @@ async def _run_fallback_recommendation(
             summaries,
         )
         recommended_products: list[RecommendedProductItem] = []
-        mobile_count = 0
+        type_counts: dict[str, int] = {}
         for p in products_ordered:
+            if not _check_and_update_product_type_count(p, type_counts, MAX_PRODUCTS_PER_TYPE):
+                continue
             ptype = (p.get("product_type") or "").strip()
-            if ptype.upper() == "MOBILE_PLAN":
-                if mobile_count >= 2:
-                    continue
-                mobile_count += 1
             tags = _normalize_tags(p.get("tags"))
             rank = len(recommended_products) + 1
             if rank > top_k:
@@ -947,12 +1027,12 @@ async def _run_fallback_recommendation(
                     product_price=int(p.get("price") or 0),
                     sale_price=int(p.get("sale_price") or p.get("price") or 0),
                     tags=tags,
-                    llm_reason=reasons[rank - 1] if rank - 1 < len(reasons) else "고객님께 적합한 상품입니다.",
+                    llm_reason=reasons[rank - 1] if rank - 1 < len(reasons) else DEFAULT_PRODUCT_REASON_TEXT,
                 )
             )
         return RecommendationResponse(
             segment=Segment.normal,
-            cached_llm_recommendation="요금제·부가서비스 유사도와 LLM 기반 추천입니다.",
+            cached_llm_recommendation=FALLBACK_VECTOR_SUMMARY,
             recommended_products=recommended_products,
             source="LIVE",
             updated_at=_utc_now_iso(),
