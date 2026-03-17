@@ -97,6 +97,13 @@ UNLIMITED_DATA_TAG_MARKER = "무제한"
 # product_type별 최대 추천 개수
 MAX_PRODUCTS_PER_TYPE = 2
 
+# LLM 기본 reason 및 메시지 상수
+DEFAULT_PRODUCT_REASON_TEXT = "고객님께 가장 적합한 상품을 추천드립니다!"
+NO_CANDIDATE_MESSAGE = "추천할 수 있는 상품이 없습니다."
+NO_MATCHED_MESSAGE = "조건에 맞는 추천 상품이 없습니다."
+FALLBACK_CACHED_MESSAGE = "고객님의 이용 패턴과 관심사를 반영한 요금제·부가서비스 추천입니다."
+FALLBACK_VECTOR_SUMMARY = "요금제·부가서비스 유사도와 LLM 기반 추천입니다."
+
 
 def _normalize_embedding_for_db(embedding: list[float]) -> list[float]:
     """
@@ -121,6 +128,26 @@ def _normalize_embedding_for_db(embedding: list[float]) -> list[float]:
         EMBEDDING_DIMENSION,
     )
     return None
+
+
+def _check_and_update_product_type_count(
+    product: dict,
+    type_counts: dict[str, int],
+    max_per_type: int,
+) -> bool:
+    """
+    상품 유형별 개수를 확인하고, 제한에 걸리지 않으면 개수를 업데이트한 뒤 True를 반환한다.
+    제한을 초과하면 False를 반환한다.
+    """
+    ptype = (product.get("product_type") or "").strip()
+    tcode = ptype.upper()
+    if not tcode:
+        return True
+    current = type_counts.get(tcode, 0)
+    if current >= max_per_type:
+        return False
+    type_counts[tcode] = current + 1
+    return True
 
 
 def _embedding_to_vector_str(embedding: list[float]) -> str:
@@ -752,11 +779,9 @@ async def _run_recommendation_with_context(
         if pid not in id_to_row:
             continue
         p = id_to_row[pid]
-        ptype = (p.get("product_type") or "").strip()
-        tcode = ptype.upper()
-        current = type_counts.get(tcode, 0)
-        if current >= MAX_PRODUCTS_PER_TYPE:
+        if not _check_and_update_product_type_count(p, type_counts, MAX_PRODUCTS_PER_TYPE):
             continue
+        ptype = (p.get("product_type") or "").strip()
         tags = _normalize_tags(p.get("tags"))
         rank = len(recommended_products) + 1
         if rank > top_k:
@@ -774,7 +799,6 @@ async def _run_recommendation_with_context(
             )
         )
         used_ids.add(p["product_id"])
-        type_counts[tcode] = current + 1
 
     # 2차: LLM이 충분한 개수를 채우지 못했거나 잘못된 product_id를 준 경우,
     # diversification된 후보 목록(products_ordered)에서 남는 슬롯을 채운다.
@@ -783,11 +807,9 @@ async def _run_recommendation_with_context(
             pid = p.get("product_id")
             if pid in used_ids:
                 continue
-            ptype = (p.get("product_type") or "").strip()
-            tcode = ptype.upper()
-            current = type_counts.get(tcode, 0)
-            if current >= MAX_PRODUCTS_PER_TYPE:
+            if not _check_and_update_product_type_count(p, type_counts, MAX_PRODUCTS_PER_TYPE):
                 continue
+            ptype = (p.get("product_type") or "").strip()
             tags = _normalize_tags(p.get("tags"))
             rank = len(recommended_products) + 1
             if rank > top_k:
@@ -942,11 +964,9 @@ async def _run_fallback_recommendation(
         recommended_products: list[RecommendedProductItem] = []
         type_counts: dict[str, int] = {}
         for p in products_ordered:
-            ptype = (p.get("product_type") or "").strip()
-            tcode = ptype.upper()
-            current = type_counts.get(tcode, 0)
-            if current >= MAX_PRODUCTS_PER_TYPE:
+            if not _check_and_update_product_type_count(p, type_counts, MAX_PRODUCTS_PER_TYPE):
                 continue
+            ptype = (p.get("product_type") or "").strip()
             tags = _normalize_tags(p.get("tags"))
             rank = len(recommended_products) + 1
             if rank > top_k:
