@@ -81,6 +81,17 @@ LEFT JOIN tab_watch_plan tw ON p.product_id = tw.product_id
 WHERE p.product_id IN :ids
 """).bindparams(bindparam("ids", expanding=True))
 
+# 기본 추천용: 임베딩/컨텍스트 없이 사용할 상품 목록 (간단 정렬 기준)
+FETCH_DEFAULT_PRODUCTS_SQL = text("""
+SELECT
+    p.product_id, p.name, p.product_type, p.price, p.sale_price, p.tags, p.embedding_text,
+    NULL::integer AS data_amount
+FROM product p
+WHERE p.embedding_text IS NOT NULL
+ORDER BY p.product_id
+LIMIT :k
+""")
+
 # retrieval 후보 수 (LLM에 넣은 뒤 3개 선택)
 RETRIEVAL_CANDIDATES_K = 50
 
@@ -102,7 +113,7 @@ DEFAULT_PRODUCT_REASON_TEXT = "고객님께 가장 적합한 상품을 추천드
 NO_CANDIDATE_MESSAGE = "추천할 수 있는 상품이 없습니다."
 NO_MATCHED_MESSAGE = "조건에 맞는 추천 상품이 없습니다."
 FALLBACK_CACHED_MESSAGE = "고객님의 이용 패턴과 관심사를 반영한 요금제·부가서비스 추천입니다."
-FALLBACK_VECTOR_SUMMARY = "요금제·부가서비스 유사도와 LLM 기반 추천입니다."
+FALLBACK_VECTOR_SUMMARY = "고객님께 어울리는 상품을 추천해드릴게요!"
 
 
 def _normalize_embedding_for_db(embedding: list[float]) -> list[float]:
@@ -873,16 +884,52 @@ async def _run_fallback_recommendation(
             )
         except Exception as e:
             logger.warning(
-                "OpenAI 임베딩 실패 (폴백): model=%s error_type=%s error=%s",
+                "OpenAI 임베딩 실패 (폴백, 기본 상품으로 대체): model=%s error_type=%s error=%s",
                 emb_model,
                 type(e).__name__,
                 e,
                 exc_info=True,
             )
+            # 임베딩 실패 시: 임의 기본 상품 목록으로 간단 추천 제공
+            default_result = await fallback_session.execute(
+                FETCH_DEFAULT_PRODUCTS_SQL,
+                {"k": top_k},
+            )
+            rows = list(default_result.mappings())
+            if not rows:
+                return RecommendationResponse(
+                    segment=Segment.normal,
+                    cached_llm_recommendation=NO_CANDIDATE_MESSAGE,
+                    recommended_products=[],
+                    source="LIVE",
+                    updated_at=_utc_now_iso(),
+                )
+            recommended_products: list[RecommendedProductItem] = []
+            type_counts: dict[str, int] = {}
+            for i, row in enumerate(rows):
+                p = dict(row)
+                if not _check_and_update_product_type_count(p, type_counts, MAX_PRODUCTS_PER_TYPE):
+                    continue
+                tags = _normalize_tags(p.get("tags"))
+                rank = len(recommended_products) + 1
+                if rank > top_k:
+                    break
+                recommended_products.append(
+                    RecommendedProductItem(
+                        rank=rank,
+                        product_id=p["product_id"],
+                        product_name=(p.get("name") or "").strip(),
+                        product_type=(p.get("product_type") or "").strip(),
+                        product_price=int(p.get("price") or 0),
+                        sale_price=int(p.get("sale_price") or p.get("price") or 0),
+                        tags=tags,
+                        llm_reason=DEFAULT_PRODUCT_REASON_TEXT,
+                    )
+                )
             return RecommendationResponse(
                 segment=Segment.normal,
-                cached_llm_recommendation="[일시 오류] 추천을 생성하지 못했습니다.",
-                recommended_products=[],
+                cached_llm_recommendation="아직 추천을 생성할만한 정보가 없어요. 대신 이 상품은 어떠세요?",
+                recommended_products=recommended_products,
                 source="LIVE",
                 updated_at=_utc_now_iso(),
             )
@@ -980,13 +1027,12 @@ async def _run_fallback_recommendation(
                     product_price=int(p.get("price") or 0),
                     sale_price=int(p.get("sale_price") or p.get("price") or 0),
                     tags=tags,
-                    llm_reason=reasons[rank - 1] if rank - 1 < len(reasons) else "고객님께 가장 적합한 상품을 추천드립니다!",
+                    llm_reason=reasons[rank - 1] if rank - 1 < len(reasons) else DEFAULT_PRODUCT_REASON_TEXT,
                 )
             )
-            type_counts[tcode] = current + 1
         return RecommendationResponse(
             segment=Segment.normal,
-            cached_llm_recommendation="요금제·부가서비스 유사도와 LLM 기반 추천입니다.",
+            cached_llm_recommendation=FALLBACK_VECTOR_SUMMARY,
             recommended_products=recommended_products,
             source="LIVE",
             updated_at=_utc_now_iso(),
