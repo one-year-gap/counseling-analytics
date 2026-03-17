@@ -32,10 +32,13 @@ class Settings(BaseSettings):
 
     # Kafka consumer (analysis request)
     kafka_consumer_enabled: bool = False
-    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_bootstrap_servers: str = Field(
+        default="",
+        validation_alias=AliasChoices("KAFKA_BOOTSTRAP_SERVERS", "MSK_BOOTSTRAP_SERVERS"),
+    )
     # kafka_analysis_request_topic: str = "analysis.request.v1"
     kafka_recommendation_topic: str = Field(
-        default="recommendation",
+        default="recommendation-topic",
         validation_alias=AliasChoices("KAFKA_RECOMMENDATION_TOPIC", "RECOMMENDATION_TOPIC"),
     )
     # kafka_analysis_response_topic: str = "analysis.response.v1"
