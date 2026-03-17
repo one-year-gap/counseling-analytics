@@ -4,13 +4,14 @@ from app.pipeline.extractor import AhoCorasickExtractor
 from app.pipeline.mapper import ExactMapper
 from app.pipeline.normalizer import normalize_with_offsets
 from app.pipeline.scorer import ContextScorer
-
+from app.pipeline.sentiment_analyzer import SentimentAnalyzer
 
 class SqlKeywordAnalysisService:
     def __init__(self) -> None:
         self.mapper = ExactMapper()
         self.extractor = AhoCorasickExtractor()
         self.scorer = ContextScorer()
+        self.sentiment_analyzer = SentimentAnalyzer()  # 감정 분석기 초기화
         self.keyword_meta: dict[str, dict[str, Any]] = {}
 
     def load_dictionary(self, keyword_rows: list[dict[str, Any]]) -> None:
@@ -27,6 +28,7 @@ class SqlKeywordAnalysisService:
                 self.keyword_meta[code] = {
                     "id": int(row["business_keyword_id"]),
                     "name": row["keyword_name"],
+                    "negative_weight": row.get("negative_weight", 0)  # DB에서 꺼내온 부정 가중치 저장
                 }
                 dict_rows.append(
                     {
@@ -52,38 +54,42 @@ class SqlKeywordAnalysisService:
         self.mapper.build_index(dict_rows)
         self.extractor.build_automaton(dict_rows)
 
-    def analyze_targets(
-        self,
-        targets: list[dict[str, Any]],
-    ) -> tuple[list[tuple[int, int, int]], list[int], list[tuple[int, str]]]:
-        mapping_rows: list[tuple[int, int, int]] = []
-        completed_ids: list[int] = []
-        failed_items: list[tuple[int, str]] = []
+    # CDC 데몬에서 딱 1건씩 호출하기 위해 만든 심플한 분석 함수
+    def analyze_single_target(self, target: dict[str, Any]) -> dict[str, Any]:
+        title = target.get("title") or ""
+        question = target.get("question_text") or ""
+        full_text = " ".join(part for part in [title, question] if part)
 
-        for target in targets:
-            analysis_id = int(target["analysis_id"])
-            try:
-                title = target.get("title") or ""
-                question = target.get("question_text") or ""
-                full_text = " ".join(part for part in [title, question] if part)
+        # 1. 기존 알고리즘 파이프라인 돌려서 키워드 추출
+        matches = self._run_full_pipeline(full_text)
+        
+        keyword_count_by_code: dict[str, int] = {}
+        for match in matches:
+            code = match["keyword_id"]
+            keyword_count_by_code[code] = keyword_count_by_code.get(code, 0) + 1
 
-                matches = self._run_full_pipeline(full_text)
-                keyword_count_by_code: dict[str, int] = {}
-                for match in matches:
-                    code = match["keyword_id"]
-                    keyword_count_by_code[code] = keyword_count_by_code.get(code, 0) + 1
+        # 2. 키워드 매핑 결과 조립 (negative_weight 포함)
+        mappings = []
+        for code, count in keyword_count_by_code.items():
+            meta = self.keyword_meta.get(code)
+            if not meta:
+                continue
+            mappings.append({
+                "businessKeywordId": meta["id"],
+                "keywordCode": code,
+                "keywordName": meta["name"],
+                "count": count,
+                "negativeWeight": meta["negative_weight"]  # 가중치 담기
+            })
 
-                for code, count in keyword_count_by_code.items():
-                    meta = self.keyword_meta.get(code)
-                    if not meta:
-                        continue
-                    mapping_rows.append((analysis_id, int(meta["id"]), int(count)))
+        # 3. 텍스트 감정 분석 (KoELECTRA)
+        sentiment = self.sentiment_analyzer.analyze(full_text)
 
-                completed_ids.append(analysis_id)
-            except Exception as exc:
-                failed_items.append((analysis_id, str(exc)[:1000]))
-
-        return mapping_rows, completed_ids, failed_items
+        # 4. 분석 결과 반환 (CDC 워커가 받아서 처리함)
+        return {
+            "sentiment": sentiment,
+            "mappings": mappings
+        }
 
     def _run_full_pipeline(self, text: str) -> list[dict[str, Any]]:
         norm_text, offset_map = normalize_with_offsets(text)

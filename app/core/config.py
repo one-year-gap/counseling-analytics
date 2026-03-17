@@ -32,12 +32,12 @@ class Settings(BaseSettings):
     # Kafka consumer (analysis request)
     kafka_consumer_enabled: bool = False
     kafka_bootstrap_servers: str = "localhost:9092"
-    kafka_analysis_request_topic: str = "analysis.request.v1"
+    # kafka_analysis_request_topic: str = "analysis.request.v1"
     kafka_recommendation_topic: str = Field(
         default="recommendation",
         validation_alias=AliasChoices("KAFKA_RECOMMENDATION_TOPIC", "RECOMMENDATION_TOPIC"),
     )
-    kafka_analysis_response_topic: str = "analysis.response.v1"
+    # kafka_analysis_response_topic: str = "analysis.response.v1"
     kafka_consumer_group_id: str = "counseling-analytics-consumer"
     kafka_auto_offset_reset: str = "earliest"
     kafka_batch_size: int = 1000
@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     kafka_max_poll_interval_ms: int = Field(default=1800000, validation_alias=AliasChoices("KAFKA_MAX_POLL_INTERVAL_MS"))
     kafka_session_timeout_ms: int = Field(default=60000, validation_alias=AliasChoices("KAFKA_SESSION_TIMEOUT_MS"))
     kafka_heartbeat_interval_ms: int = Field(default=15000, validation_alias=AliasChoices("KAFKA_HEARTBEAT_INTERVAL_MS"))
+
+    spring_api_url: str = Field(
+        default="http://admin-api.holliverse.internal:8081/internal/v1/analysis-consultation", 
+        validation_alias=AliasChoices("SPRING_API_URL")
+    )
 
     # PostgreSQL connection for bulk lookup
     postgres_dsn: str = Field(default="", validation_alias=AliasChoices("POSTGRES_DSN", "DB_DSN"))
