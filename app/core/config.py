@@ -10,8 +10,12 @@ import os
 class Settings(BaseSettings):
     app_name: str = "intelligence-server"
     app_env: str = "local"
+    app_mode: str = Field(default="", validation_alias=AliasChoices("APP_MODE"))
     debug: bool = False
-    cdc_analysis_enabled: bool = False
+    cdc_analysis_enabled: bool | None = Field(
+        default=None,
+        validation_alias=AliasChoices("CDC_ANALYSIS_ENABLED"),
+    )
 
     api_v1_prefix: str = "/api/v1"
     log_level: str = "INFO"
@@ -118,6 +122,13 @@ class Settings(BaseSettings):
         if dsn.startswith("postgres://"):
             return dsn.replace("postgres://", "postgresql+asyncpg://", 1)
         return dsn
+
+    @property
+    def effective_cdc_analysis_enabled(self) -> bool:
+        if self.cdc_analysis_enabled is not None:
+            return self.cdc_analysis_enabled
+
+        return self.app_mode in {"server", "analysis-server"}
 
 
 @lru_cache
