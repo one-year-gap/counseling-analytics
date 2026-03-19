@@ -3,7 +3,12 @@ import logging
 import re
 from datetime import datetime, timezone
 
-from aiokafka import AIOKafkaProducer
+try:
+    from aiokafka import AIOKafkaProducer
+except Exception:  # pragma: no cover
+    # 평가 스크립트/로컬 환경에서 Kafka 의존성이 없을 수 있다.
+    # Kafka 미설정 시 publish_recommendation_to_kafka에서 안전하게 스킵한다.
+    AIOKafkaProducer = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 from openai import AsyncOpenAI
@@ -71,6 +76,17 @@ ORDER BY (embedding_vector <#> :query_vec)
 LIMIT :k
 """)
 
+# product_type별 벡터 검색: 타입을 분산시켜 후보 풀 편향을 완화
+SEARCH_SIMILAR_BY_TYPE_SQL = text("""
+SELECT product_id
+FROM product
+WHERE embedding_vector IS NOT NULL
+  AND product_type = :ptype
+  AND (NOT (product_id = ANY(:exclude_ids)))
+ORDER BY embedding_vector <#> :query_vec
+LIMIT :k
+""")
+
 # 추천 후보 상품 상세 조회. data_amount는 OVER/UNDER 재정렬용 (mobile_plan·tab_watch_plan)
 FETCH_PRODUCTS_FULL_SQL = text("""
 SELECT
@@ -95,6 +111,16 @@ LIMIT :k
 
 # retrieval 후보 수 (LLM에 넣은 뒤 3개 선택)
 RETRIEVAL_CANDIDATES_K = 50
+
+# 타입별로 최소 후보를 확보하기 위한 설정
+MAIN_PRODUCT_TYPES: tuple[str, ...] = (
+    "MOBILE_PLAN",
+    "INTERNET",
+    "IPTV",
+    "TAB_WATCH_PLAN",
+    "ADDON",
+)
+RETRIEVAL_PER_TYPE_K = 10
 
 # member_llm_context 미구축 시 사용할 기본 쿼리 텍스트
 DEFAULT_RETRIEVAL_QUERY = "통신 요금제, 데이터 요금제, 부가서비스 추천"
@@ -654,30 +680,60 @@ async def _run_recommendation_with_context(
     product_type_weights = compute_product_type_weights(ctx)
     boost_type1, boost1, boost_type2, boost2 = _product_type_boost_from_weights(product_type_weights)
     use_type_boost = (boost1 > 0 or boost2 > 0)
-    if use_type_boost:
-        result = await session.execute(
-            SEARCH_SIMILAR_WITH_TYPE_BOOST_SQL,
+
+    # 2-1) 타입별 검색으로 후보 풀 분산(최소 1개/타입 유도)
+    seen: set[int] = set()
+    product_ids: list[int] = []
+    for ptype in MAIN_PRODUCT_TYPES:
+        r = await session.execute(
+            SEARCH_SIMILAR_BY_TYPE_SQL,
             {
                 "query_vec": query_vec,
                 "exclude_ids": exclude_ids,
-                "k": RETRIEVAL_CANDIDATES_K,
-                "boost_type1": boost_type1,
-                "boost1": boost1,
-                "boost_type2": boost_type2,
-                "boost2": boost2,
+                "ptype": ptype,
+                "k": RETRIEVAL_PER_TYPE_K,
             },
         )
-    else:
-        result = await session.execute(
-            SEARCH_SIMILAR_SQL,
-            {
-                "query_vec": query_vec,
-                "exclude_ids": exclude_ids,
-                "k": RETRIEVAL_CANDIDATES_K,
-            },
-        )
-    rows = result.fetchall()
-    product_ids = [r[0] for r in rows]
+        for row in r.fetchall():
+            pid = row[0]
+            if pid in seen:
+                continue
+            product_ids.append(pid)
+            seen.add(pid)
+
+    # 2-2) 부족분은 기존 전체 검색(가중치 boost 포함 가능)으로 보충
+    if len(product_ids) < RETRIEVAL_CANDIDATES_K:
+        if use_type_boost:
+            result = await session.execute(
+                SEARCH_SIMILAR_WITH_TYPE_BOOST_SQL,
+                {
+                    "query_vec": query_vec,
+                    "exclude_ids": exclude_ids,
+                    "k": RETRIEVAL_CANDIDATES_K,
+                    "boost_type1": boost_type1,
+                    "boost1": boost1,
+                    "boost_type2": boost_type2,
+                    "boost2": boost2,
+                },
+            )
+        else:
+            result = await session.execute(
+                SEARCH_SIMILAR_SQL,
+                {
+                    "query_vec": query_vec,
+                    "exclude_ids": exclude_ids,
+                    "k": RETRIEVAL_CANDIDATES_K,
+                },
+            )
+        for row in result.fetchall():
+            pid = row[0]
+            if pid in seen:
+                continue
+            product_ids.append(pid)
+            seen.add(pid)
+            if len(product_ids) >= RETRIEVAL_CANDIDATES_K:
+                break
+
     if not product_ids:
         return RecommendationResponse(
             segment=_segment_enum(ctx.get("segment")),
@@ -915,7 +971,6 @@ async def _run_recommendation_with_context(
                 )
             )
             used_ids.add(pid)
-            type_counts[tcode] = current + 1
 
     return RecommendationResponse(
         segment=_segment_enum(ctx.get("segment")),
@@ -1020,16 +1075,43 @@ async def _run_fallback_recommendation(
                 updated_at=_utc_now_iso(),
             )
 
-        result = await fallback_session.execute(
-            SEARCH_SIMILAR_SQL,
-            {
-                "query_vec": query_vec,
-                "exclude_ids": [0],
-                "k": top_k,
-            },
-        )
-        rows = result.fetchall()
-        product_ids = [r[0] for r in rows]
+        # 폴백에서도 타입별 후보를 먼저 확보해 모바일 쏠림을 완화
+        seen: set[int] = set()
+        product_ids: list[int] = []
+        for ptype in MAIN_PRODUCT_TYPES:
+            r = await fallback_session.execute(
+                SEARCH_SIMILAR_BY_TYPE_SQL,
+                {
+                    "query_vec": query_vec,
+                    "exclude_ids": [0],
+                    "ptype": ptype,
+                    "k": RETRIEVAL_PER_TYPE_K,
+                },
+            )
+            for row in r.fetchall():
+                pid = row[0]
+                if pid in seen:
+                    continue
+                product_ids.append(pid)
+                seen.add(pid)
+
+        if len(product_ids) < RETRIEVAL_CANDIDATES_K:
+            result = await fallback_session.execute(
+                SEARCH_SIMILAR_SQL,
+                {
+                    "query_vec": query_vec,
+                    "exclude_ids": [0],
+                    "k": RETRIEVAL_CANDIDATES_K,
+                },
+            )
+            for row in result.fetchall():
+                pid = row[0]
+                if pid in seen:
+                    continue
+                product_ids.append(pid)
+                seen.add(pid)
+                if len(product_ids) >= RETRIEVAL_CANDIDATES_K:
+                    break
         logger.info("recommendation: 폴백 벡터 검색 완료 product_ids=%s", product_ids[:10] if len(product_ids) > 10 else product_ids)
         if not product_ids:
             return RecommendationResponse(
@@ -1133,6 +1215,9 @@ async def publish_recommendation_to_kafka(
     settings = get_settings()
     topic = getattr(settings, "kafka_recommendation_topic", "recommendation")
     bootstrap = getattr(settings, "kafka_bootstrap_servers", "").strip()
+    if AIOKafkaProducer is None:
+        logger.warning("recommendation: aiokafka 미설치, Kafka 발행 스킵 member_id=%s", member_id)
+        return
     if not bootstrap:
         logger.warning("recommendation: Kafka 미설정, 발행 스킵 member_id=%s", member_id)
         return

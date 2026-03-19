@@ -1,6 +1,9 @@
 from collections.abc import AsyncGenerator
 
-from pgvector.asyncpg import register_vector
+try:
+    from pgvector.asyncpg import register_vector
+except Exception:  # pragma: no cover
+    register_vector = None  # type: ignore[assignment]
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -34,9 +37,10 @@ SessionLocal: async_sessionmaker[AsyncSession] | None = None
 if (settings.effective_database_url or "").strip():
     engine = create_engine()
     # pgvector 등록: asyncpg 연결 시 vector 타입 등록
-    @event.listens_for(engine.sync_engine, "connect")
-    def register_pgvector(dbapi_connection, connection_record) -> None:
-        dbapi_connection.run_async(register_vector)
+    if register_vector is not None:
+        @event.listens_for(engine.sync_engine, "connect")
+        def register_pgvector(dbapi_connection, connection_record) -> None:
+            dbapi_connection.run_async(register_vector)
 
     SessionLocal = async_sessionmaker(
         bind=engine,
