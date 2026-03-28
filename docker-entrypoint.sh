@@ -4,6 +4,10 @@ set -eu
 APP_MODE="${APP_MODE:-server}"
 APP_HOST="${APP_HOST:-0.0.0.0}"
 APP_PORT="${APP_PORT:-8000}"
+PINPOINT_ENABLED="${PINPOINT_ENABLED:-false}"
+PINPOINT_APPLICATION_NAME="${PINPOINT_APPLICATION_NAME:-intelligence-server}"
+PINPOINT_AGENT_ID="${PINPOINT_AGENT_ID:-intelligence-server}"
+PINPOINT_COLLECTOR_AGENT_URI="${PINPOINT_COLLECTOR_AGENT_URI:-}"
 
 child_pid=""
 
@@ -41,6 +45,9 @@ run_bg_and_wait() {
 
 run_server() {
   echo "[entrypoint] APP_MODE=${APP_MODE} -> starting unified intelligence server"
+  if [ "${PINPOINT_ENABLED}" = "true" ]; then
+    echo "[entrypoint] Pinpoint Python agent enabled app=${PINPOINT_APPLICATION_NAME} agent=${PINPOINT_AGENT_ID} collector=${PINPOINT_COLLECTOR_AGENT_URI:-unset}"
+  fi
   run_bg_and_wait uvicorn app.realtime.main:app --host "${APP_HOST}" --port "${APP_PORT}"
 }
 
