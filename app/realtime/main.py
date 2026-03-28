@@ -36,7 +36,11 @@ async def lifespan(application: FastAPI):
         cdc_service = CdcAnalysisService(runtime_settings)
         await cdc_service.start()
         application.state.cdc_service = cdc_service
-        logging.info("CDC analysis service enabled inside unified intelligence runtime.")
+        logging.info("APP_MODE: %s", runtime_settings.app_mode or "(unset)")
+        logging.info(
+            "CDC analysis enabled: %s",
+            runtime_settings.effective_cdc_analysis_enabled,
+        )
 
     try:
         yield
