@@ -28,7 +28,6 @@ def build_fastapi_pinpoint_middleware(settings: Settings) -> list[Any]:
             PinPointMiddleWare,
             async_monkey_patch_for_pinpoint,
         )
-        from pinpointPy.libs import monkey_patch_for_pinpoint
     except ImportError:
         logging.exception("Pinpoint Python dependencies are not installed. Skipping Pinpoint startup.")
         return []
@@ -38,7 +37,6 @@ def build_fastapi_pinpoint_middleware(settings: Settings) -> list[Any]:
         collector_agent_uri=collector_agent_uri,
         set_agent=set_agent,
         async_monkey_patch_for_pinpoint=async_monkey_patch_for_pinpoint,
-        monkey_patch_for_pinpoint=monkey_patch_for_pinpoint,
     )
 
     return [
@@ -52,7 +50,6 @@ def _initialize_pinpoint(
     collector_agent_uri: str,
     set_agent: Any,
     async_monkey_patch_for_pinpoint: Any,
-    monkey_patch_for_pinpoint: Any,
 ) -> None:
     global _PINPOINT_INITIALIZED
 
@@ -73,17 +70,6 @@ def _initialize_pinpoint(
         )
         install_hybrid_trace_context()
         async_monkey_patch_for_pinpoint(AioRedis=False, httpx=True)
-        monkey_patch_for_pinpoint(
-            pymongo=False,
-            PyMysql=False,
-            pyRedis=False,
-            requests=False,
-            urllib=False,
-            sqlalchemy=True,
-            MySQLdb=False,
-            MysqlConnector=False,
-            pyscopg2=False,
-        )
         logging.info(
             "Pinpoint Python agent initialized app=%s agent=%s collector=%s",
             settings.pinpoint_application_name,

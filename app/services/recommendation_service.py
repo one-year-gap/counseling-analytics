@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 try:
     from aiokafka import AIOKafkaProducer
@@ -152,6 +153,7 @@ NO_CANDIDATE_MESSAGE = "추천할 수 있는 상품이 없습니다."
 NO_MATCHED_MESSAGE = "조건에 맞는 추천 상품이 없습니다."
 FALLBACK_CACHED_MESSAGE = "고객님의 이용 패턴과 관심사를 반영한 요금제·부가서비스 추천입니다."
 FALLBACK_VECTOR_SUMMARY = "고객님께 어울리는 상품을 추천해드릴게요!"
+POSTGRES_SERVER_TYPE = getattr(Defines, "PP_POSTGRESQL", "2501")
 KAFKA_SERVER_TYPE = getattr(Defines, "PP_KAFKA", "8660")
 
 
@@ -434,6 +436,40 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _postgres_destination() -> str:
+    database_url = getattr(get_settings(), "effective_database_url", "") or ""
+    parsed = urlparse(database_url)
+    host = (parsed.hostname or "").strip()
+    if host and parsed.port:
+        return f"{host}:{parsed.port}"
+    if host:
+        return host
+    return "postgresql"
+
+
+def _statement_to_sql(statement: object) -> str:
+    return str(getattr(statement, "text", statement))
+
+
+async def _execute_with_postgres_trace(
+    session: AsyncSession,
+    statement: object,
+    params: dict | None = None,
+    *,
+    args_value: str | None = None,
+):
+    async with traced_external_span(
+        "sqlalchemy.execute",
+        POSTGRES_SERVER_TYPE,
+        _postgres_destination(),
+        sql=_statement_to_sql(statement),
+        args_value=args_value,
+    ):
+        if params is None:
+            return await session.execute(statement)
+        return await session.execute(statement, params)
+
+
 def _exclude_ids_from_context(ctx: dict) -> list[int]:
     """current_subscriptions에서 product_id 목록 추출. DB 제외용."""
     raw = ctx.get("current_subscriptions")
@@ -473,7 +509,12 @@ async def _get_subscription_max_price_by_type(
     if not exclude_ids or exclude_ids == [0]:
         return {}
 
-    result = await session.execute(FETCH_SUBSCRIPTION_PRICES_SQL, {"ids": exclude_ids})
+    result = await _execute_with_postgres_trace(
+        session,
+        FETCH_SUBSCRIPTION_PRICES_SQL,
+        {"ids": exclude_ids},
+        args_value=f"subscription_count={len(exclude_ids)}",
+    )
     by_type: dict[str, int] = {}
     for row in result.mappings():
         r = dict(row)
@@ -697,7 +738,8 @@ async def _run_recommendation_with_context(
     seen: set[int] = set()
     product_ids: list[int] = []
     for ptype in MAIN_PRODUCT_TYPES:
-        r = await session.execute(
+        r = await _execute_with_postgres_trace(
+            session,
             SEARCH_SIMILAR_BY_TYPE_SQL,
             {
                 "query_vec": query_vec,
@@ -705,6 +747,7 @@ async def _run_recommendation_with_context(
                 "ptype": ptype,
                 "k": RETRIEVAL_PER_TYPE_K,
             },
+            args_value=f"ptype={ptype}, k={RETRIEVAL_PER_TYPE_K}",
         )
         for row in r.fetchall():
             pid = row[0]
@@ -716,7 +759,8 @@ async def _run_recommendation_with_context(
     # 2-2) 부족분은 기존 전체 검색(가중치 boost 포함 가능)으로 보충
     if len(product_ids) < RETRIEVAL_CANDIDATES_K:
         if use_type_boost:
-            result = await session.execute(
+            result = await _execute_with_postgres_trace(
+                session,
                 SEARCH_SIMILAR_WITH_TYPE_BOOST_SQL,
                 {
                     "query_vec": query_vec,
@@ -727,15 +771,18 @@ async def _run_recommendation_with_context(
                     "boost_type2": boost_type2,
                     "boost2": boost2,
                 },
+                args_value=f"k={RETRIEVAL_CANDIDATES_K}, boost_type1={boost_type1}, boost_type2={boost_type2}",
             )
         else:
-            result = await session.execute(
+            result = await _execute_with_postgres_trace(
+                session,
                 SEARCH_SIMILAR_SQL,
                 {
                     "query_vec": query_vec,
                     "exclude_ids": exclude_ids,
                     "k": RETRIEVAL_CANDIDATES_K,
                 },
+                args_value=f"k={RETRIEVAL_CANDIDATES_K}",
             )
         for row in result.fetchall():
             pid = row[0]
@@ -755,7 +802,12 @@ async def _run_recommendation_with_context(
             updated_at=_utc_now_iso(),
         )
 
-    full_result = await session.execute(FETCH_PRODUCTS_FULL_SQL, {"ids": product_ids})
+    full_result = await _execute_with_postgres_trace(
+        session,
+        FETCH_PRODUCTS_FULL_SQL,
+        {"ids": product_ids},
+        args_value=f"product_count={len(product_ids)}",
+    )
     id_to_row = {}
     for row in full_result.mappings():
         r = dict(row)
@@ -1035,9 +1087,11 @@ async def _run_fallback_recommendation(
                 exc_info=True,
             )
             # 임베딩 실패 시: 임의 기본 상품 목록으로 간단 추천 제공
-            default_result = await fallback_session.execute(
+            default_result = await _execute_with_postgres_trace(
+                fallback_session,
                 FETCH_DEFAULT_PRODUCTS_SQL,
                 {"k": top_k},
+                args_value=f"k={top_k}",
             )
             rows = list(default_result.mappings())
             if not rows:
@@ -1091,7 +1145,8 @@ async def _run_fallback_recommendation(
         seen: set[int] = set()
         product_ids: list[int] = []
         for ptype in MAIN_PRODUCT_TYPES:
-            r = await fallback_session.execute(
+            r = await _execute_with_postgres_trace(
+                fallback_session,
                 SEARCH_SIMILAR_BY_TYPE_SQL,
                 {
                     "query_vec": query_vec,
@@ -1099,6 +1154,7 @@ async def _run_fallback_recommendation(
                     "ptype": ptype,
                     "k": RETRIEVAL_PER_TYPE_K,
                 },
+                args_value=f"ptype={ptype}, k={RETRIEVAL_PER_TYPE_K}",
             )
             for row in r.fetchall():
                 pid = row[0]
@@ -1108,13 +1164,15 @@ async def _run_fallback_recommendation(
                 seen.add(pid)
 
         if len(product_ids) < RETRIEVAL_CANDIDATES_K:
-            result = await fallback_session.execute(
+            result = await _execute_with_postgres_trace(
+                fallback_session,
                 SEARCH_SIMILAR_SQL,
                 {
                     "query_vec": query_vec,
                     "exclude_ids": [0],
                     "k": RETRIEVAL_CANDIDATES_K,
                 },
+                args_value=f"k={RETRIEVAL_CANDIDATES_K}",
             )
             for row in result.fetchall():
                 pid = row[0]
@@ -1134,7 +1192,12 @@ async def _run_fallback_recommendation(
                 updated_at=_utc_now_iso(),
             )
 
-        full_result = await fallback_session.execute(FETCH_PRODUCTS_FULL_SQL, {"ids": product_ids})
+        full_result = await _execute_with_postgres_trace(
+            fallback_session,
+            FETCH_PRODUCTS_FULL_SQL,
+            {"ids": product_ids},
+            args_value=f"product_count={len(product_ids)}",
+        )
         id_to_row = {}
         for row in full_result.mappings():
             r = dict(row)
@@ -1289,9 +1352,11 @@ class RecommendationService:
         - 쿼리 오류가 발생하면 롤백 후 None을 반환한다.
         """
         try:
-            ctx_result = await session.execute(
+            ctx_result = await _execute_with_postgres_trace(
+                session,
                 FETCH_MEMBER_LLM_CONTEXT_SQL,
                 {"member_id": member_id},
+                args_value=f"member_id={member_id}",
             )
             row = ctx_result.fetchone()
             if row is None:

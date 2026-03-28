@@ -232,7 +232,6 @@ async def traced_external_span(
             pinpoint.add_trace_header(Defines.PP_SQL_FORMAT, _normalize_sql(sql), trace_id)
         if topic:
             pinpoint.add_trace_header(Defines.PP_KAFKA_TOPIC, topic, trace_id)
-            pinpoint.add_trace_header_v2(Defines.PP_MESSAGE_QUEUE_URI, destination, trace_id)
         if args_value:
             pinpoint.add_trace_header_v2(Defines.PP_ARGS, args_value, trace_id)
 
