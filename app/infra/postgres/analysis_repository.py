@@ -1,5 +1,15 @@
 from __future__ import annotations
+
+try:
+    from pinpointPy import Defines
+except Exception:  # pragma: no cover
+    Defines = None  # type: ignore[assignment]
+
 from asyncpg import Pool, Record
+
+from app.infra.pinpoint_tracing import resolve_postgresql_destination, traced_external_span
+
+POSTGRES_SERVER_TYPE = getattr(Defines, "PP_POSTGRESQL", "2501")
 
 
 class AnalysisRepository:
@@ -21,7 +31,14 @@ class AnalysisRepository:
         WHERE case_id = $1
         """
         async with self._pool.acquire() as conn:
-            return await conn.fetchrow(sql, case_id)
+            async with traced_external_span(
+                "asyncpg.fetchrow",
+                POSTGRES_SERVER_TYPE,
+                resolve_postgresql_destination(conn),
+                sql=sql,
+                args_value=f"case_id={case_id}",
+            ):
+                return await conn.fetchrow(sql, case_id)
 
     async def load_active_keyword_rows(self) -> list[Record]:
         sql = """
@@ -41,7 +58,13 @@ class AnalysisRepository:
         ORDER BY bk.business_keyword_id, bka.alias_id
         """
         async with self._pool.acquire() as conn:
-            return await conn.fetch(sql)
+            async with traced_external_span(
+                "asyncpg.fetch",
+                POSTGRES_SERVER_TYPE,
+                resolve_postgresql_destination(conn),
+                sql=sql,
+            ):
+                return await conn.fetch(sql)
         
     # 분석 완료 후 분석 내역 및 매핑 결과를 DB에 바로 저장하는 쿼리
     # UPSERT를 적용하여 수정(UPDATE)된 상담글의 재분석 결과 덮어쓰기 지원
@@ -66,7 +89,14 @@ class AnalysisRepository:
                 DO UPDATE SET updated_at = NOW(), analyzer_version = EXCLUDED.analyzer_version
                 RETURNING analysis_id
                 """
-                analysis_id = await conn.fetchval(analysis_sql, case_id, analyzer_version)
+                async with traced_external_span(
+                    "asyncpg.fetchval",
+                    POSTGRES_SERVER_TYPE,
+                    resolve_postgresql_destination(conn),
+                    sql=analysis_sql,
+                    args_value=f"case_id={case_id}, analyzer_version={analyzer_version}",
+                ):
+                    analysis_id = await conn.fetchval(analysis_sql, case_id, analyzer_version)
 
                 # 2. 기존 키워드 매핑 결과 초기화 (싹 비우기)
                 # 고객이 글을 수정하면서 기존에 있던 키워드가 사라졌을 수도 있으므로,
@@ -75,7 +105,14 @@ class AnalysisRepository:
                 DELETE FROM business_keyword_mapping_result 
                 WHERE analysis_id = $1
                 """
-                await conn.execute(delete_mapping_sql, analysis_id)
+                async with traced_external_span(
+                    "asyncpg.execute",
+                    POSTGRES_SERVER_TYPE,
+                    resolve_postgresql_destination(conn),
+                    sql=delete_mapping_sql,
+                    args_value=f"analysis_id={analysis_id}",
+                ):
+                    await conn.execute(delete_mapping_sql, analysis_id)
 
                 # 3. 새로운(또는 변경된) 키워드 매핑 결과 적재
                 if mappings:
@@ -88,6 +125,13 @@ class AnalysisRepository:
                         (analysis_id, m["businessKeywordId"], m["count"]) 
                         for m in mappings
                     ]
-                    await conn.executemany(mapping_sql, mapping_data)
+                    async with traced_external_span(
+                        "asyncpg.executemany",
+                        POSTGRES_SERVER_TYPE,
+                        resolve_postgresql_destination(conn),
+                        sql=mapping_sql,
+                        args_value=f"analysis_id={analysis_id}, mapping_count={len(mapping_data)}",
+                    ):
+                        await conn.executemany(mapping_sql, mapping_data)
 
                 return analysis_id

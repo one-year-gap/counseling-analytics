@@ -3,6 +3,7 @@ from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
+from app.infra.pinpoint_tracing import capture_current_trace_snapshot
 from app.schemas.recommendation import RecommendationRequest
 from app.services.recommendation_service import run_recommendation_and_publish_to_kafka
 
@@ -20,5 +21,6 @@ async def post_recommendations(
     Spring이 Kafka consume → persona_recommendation 적재 → CompletableFuture.complete(결과).
     """
     _ = session
-    background_tasks.add_task(run_recommendation_and_publish_to_kafka, body.member_id)
+    trace_snapshot = capture_current_trace_snapshot()
+    background_tasks.add_task(run_recommendation_and_publish_to_kafka, body.member_id, trace_snapshot)
     return Response(status_code=202, content=None)

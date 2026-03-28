@@ -10,6 +10,11 @@ except Exception:  # pragma: no cover
     # Kafka 미설정 시 publish_recommendation_to_kafka에서 안전하게 스킵한다.
     AIOKafkaProducer = None  # type: ignore[assignment]
 
+try:
+    from pinpointPy import Defines
+except Exception:  # pragma: no cover
+    Defines = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 from openai import AsyncOpenAI
 from sqlalchemy import bindparam, text
@@ -19,6 +24,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.infra.kafka.client_options import build_kafka_client_options
+from app.infra.pinpoint_tracing import (
+    TraceSnapshot,
+    resolve_kafka_destination,
+    traced_external_span,
+    traced_root_transaction,
+)
 from app.schemas.recommendation import (
     RecommendedProductItem,
     RecommendationResponse,
@@ -141,6 +152,7 @@ NO_CANDIDATE_MESSAGE = "추천할 수 있는 상품이 없습니다."
 NO_MATCHED_MESSAGE = "조건에 맞는 추천 상품이 없습니다."
 FALLBACK_CACHED_MESSAGE = "고객님의 이용 패턴과 관심사를 반영한 요금제·부가서비스 추천입니다."
 FALLBACK_VECTOR_SUMMARY = "고객님께 어울리는 상품을 추천해드릴게요!"
+KAFKA_SERVER_TYPE = getattr(Defines, "PP_KAFKA", "8660")
 
 
 def _normalize_embedding_for_db(embedding: list[float]) -> list[float]:
@@ -1198,11 +1210,20 @@ async def _run_fallback_recommendation(
         )
 
 
-async def run_recommendation_and_publish_to_kafka(member_id: int) -> None:
+async def run_recommendation_and_publish_to_kafka(
+    member_id: int,
+    trace_snapshot: TraceSnapshot | None = None,
+) -> None:
     """백그라운드: 추천 생성 후 Kafka 발행. Spring이 202 후 이 메시지를 consume해 DB 적재·CompletableFuture 완료."""
     try:
-        resp = await get_recommendation(session=None, member_id=member_id)
-        await publish_recommendation_to_kafka(member_id, resp)
+        async with traced_root_transaction(
+            "recommendation.background",
+            f"/api/v1/recommendations/{member_id}/background",
+            snapshot=trace_snapshot,
+            request_client="fastapi-background-task",
+        ):
+            resp = await get_recommendation(session=None, member_id=member_id)
+            await publish_recommendation_to_kafka(member_id, resp)
     except Exception as e:
         logger.error("recommendation: 백그라운드 추천/Kafka 실패 member_id=%s: %s", member_id, e, exc_info=True)
 
@@ -1222,13 +1243,21 @@ async def publish_recommendation_to_kafka(
         logger.warning("recommendation: Kafka 미설정, 발행 스킵 member_id=%s", member_id)
         return
     payload = {"memberId": member_id, **response.model_dump(by_alias=True)}
+    kafka_destination = resolve_kafka_destination(bootstrap, topic)
     producer = AIOKafkaProducer(
         value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
         **build_kafka_client_options(settings),
     )
     try:
-        await producer.start()
-        await producer.send_and_wait(topic, value=payload, key=str(member_id).encode("utf-8"))
+        async with traced_external_span(
+            "aiokafka.producer.send_and_wait",
+            KAFKA_SERVER_TYPE,
+            kafka_destination,
+            topic=topic,
+            args_value=f"member_id={member_id}",
+        ):
+            await producer.start()
+            await producer.send_and_wait(topic, value=payload, key=str(member_id).encode("utf-8"))
         logger.info("recommendation: Kafka 발행 완료 member_id=%s topic=%s", member_id, topic)
     except Exception as e:
         logger.error("recommendation: Kafka 발행 실패 member_id=%s: %s", member_id, e, exc_info=True)

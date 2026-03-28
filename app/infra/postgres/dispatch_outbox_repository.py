@@ -1,4 +1,15 @@
+from __future__ import annotations
+
+try:
+    from pinpointPy import Defines
+except Exception:  # pragma: no cover
+    Defines = None  # type: ignore[assignment]
+
 from asyncpg import Pool
+
+from app.infra.pinpoint_tracing import resolve_postgresql_destination, traced_external_span
+
+POSTGRES_SERVER_TYPE = getattr(Defines, "PP_POSTGRESQL", "2501")
 
 
 class DispatchOutboxRepository:
@@ -20,7 +31,14 @@ class DispatchOutboxRepository:
         """
 
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(sql, request_ids)
+            async with traced_external_span(
+                "asyncpg.fetch",
+                POSTGRES_SERVER_TYPE,
+                resolve_postgresql_destination(conn),
+                sql=sql,
+                args_value=f"request_count={len(request_ids)}",
+            ):
+                rows = await conn.fetch(sql, request_ids)
 
         return {
             str(row["request_id"]): {
@@ -46,7 +64,14 @@ class DispatchOutboxRepository:
         """
 
         async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(sql, request_id, analysis_status)
+            async with traced_external_span(
+                "asyncpg.fetchrow",
+                POSTGRES_SERVER_TYPE,
+                resolve_postgresql_destination(conn),
+                sql=sql,
+                args_value=f"request_id={request_id}, analysis_status={analysis_status}",
+            ):
+                row = await conn.fetchrow(sql, request_id, analysis_status)
 
         return row is not None
 
@@ -78,6 +103,13 @@ class DispatchOutboxRepository:
         """
 
         async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(sql, request_id, last_error, max_attempts, analysis_status)
+            async with traced_external_span(
+                "asyncpg.fetchrow",
+                POSTGRES_SERVER_TYPE,
+                resolve_postgresql_destination(conn),
+                sql=sql,
+                args_value=f"request_id={request_id}, max_attempts={max_attempts}, analysis_status={analysis_status}",
+            ):
+                row = await conn.fetchrow(sql, request_id, last_error, max_attempts, analysis_status)
 
         return str(row["dispatch_status"]) if row is not None else "RETRY"

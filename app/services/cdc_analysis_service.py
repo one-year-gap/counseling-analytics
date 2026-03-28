@@ -5,6 +5,7 @@ from typing import Any
 from asyncpg import Connection
 
 from app.core.config import Settings
+from app.infra.pinpoint_tracing import traced_root_transaction
 from app.infra.postgres.analysis_repository import AnalysisRepository
 from app.infra.postgres.client import create_postgres_pool
 from app.services.analysis_outcome_service import AnalysisOutcomeService
@@ -84,50 +85,58 @@ class CdcAnalysisService:
         # HTTP 연결을 재사용하여 통신 속도를 높이기 위한 AsyncClient 생성
         async with httpx.AsyncClient(timeout=10.0) as http_client:
             while not self._stop_event.is_set():
+                case_id: int | None = None
+                task_received = False
                 try:
                     # 큐에 case_id가 들어올 때까지 조용히 대기
                     case_id = await self._queue.get()
-                    
-                    # 1. DB에서 원본 상담 데이터 조회
-                    case_record = await self._analysis_repository.find_case_by_id(case_id)
-                    if not case_record:
-                        logger.warning(f"case_id={case_id} 데이터를 찾을 수 없어 분석을 건너뜁니다.")
-                        continue
-                    
-                    # 분석기 파라미터 규격에 맞게 딕셔너리 포맷팅
-                    target = dict(case_record)
-                    target["analysis_id"] = None
-                    target["analyzer_version"] = 1 
-                    
-                    # 2. 분석 파이프라인 돌리기 (KoELECTRA 감정 분석 + 키워드 추출)
-                    analysis_result = self._analysis_service.analyze_single_target(target)
-                    
-                    # 3. DB에 분석 결과 먼저 안전하게 덮어쓰기 (UPSERT)
-                    # 여기서 DB가 방금 생성한 analysis_id를 받아옴
-                    analysis_id = await self._analysis_repository.save_analysis_result(
-                        case_id=case_id, 
-                        analyzer_version=1, 
-                        mappings=analysis_result["mappings"]
-                    )
-                    logger.info(f"[DB 저장 성공] case_id={case_id} 자체 DB 저장 완료 (analysis_id={analysis_id})")
+                    task_received = True
 
-                    # 4. JSON 조립하기
-                    payload = self._outcome_service.build_http_outcome(
-                        case_id=case_id,
-                        analyzer_version=1,
-                        analysis_id=analysis_id, # null 대신 진짜 ID 주입
-                        member_id=target["member_id"],
-                        sentiment=analysis_result["sentiment"],
-                        mappings=analysis_result["mappings"],
-                    )
+                    async with traced_root_transaction(
+                        "cdc.worker.process",
+                        f"/internal/cdc/support-case/{case_id}",
+                        request_client="postgresql-notify",
+                    ):
+                        # 1. DB에서 원본 상담 데이터 조회
+                        case_record = await self._analysis_repository.find_case_by_id(case_id)
+                        if not case_record:
+                            logger.warning(f"case_id={case_id} 데이터를 찾을 수 없어 분석을 건너뜁니다.")
+                            continue
+                        
+                        # 분석기 파라미터 규격에 맞게 딕셔너리 포맷팅
+                        target = dict(case_record)
+                        target["analysis_id"] = None
+                        target["analyzer_version"] = 1 
+                        
+                        # 2. 분석 파이프라인 돌리기 (KoELECTRA 감정 분석 + 키워드 추출)
+                        analysis_result = self._analysis_service.analyze_single_target(target)
+                        
+                        # 3. DB에 분석 결과 먼저 안전하게 덮어쓰기 (UPSERT)
+                        # 여기서 DB가 방금 생성한 analysis_id를 받아옴
+                        analysis_id = await self._analysis_repository.save_analysis_result(
+                            case_id=case_id, 
+                            analyzer_version=1, 
+                            mappings=analysis_result["mappings"]
+                        )
+                        logger.info(f"[DB 저장 성공] case_id={case_id} 자체 DB 저장 완료 (analysis_id={analysis_id})")
 
-                    # import json
-                    # logger.info(f"[분석 완료 - JSON 결과물]\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
+                        # 4. JSON 조립하기
+                        payload = self._outcome_service.build_http_outcome(
+                            case_id=case_id,
+                            analyzer_version=1,
+                            analysis_id=analysis_id, # null 대신 진짜 ID 주입
+                            member_id=target["member_id"],
+                            sentiment=analysis_result["sentiment"],
+                            mappings=analysis_result["mappings"],
+                        )
 
-                    # 5. 마지막으로 Spring API 서버로 HTTP POST 전송 시도
-                    response = await http_client.post(self._spring_api_url, json=payload)
-                    response.raise_for_status() # 200번대 성공이 아니면 여기서 HTTPError 발생
-                    logger.info(f"[전송 성공] case_id={case_id} Spring API 전송 완료")
+                        # import json
+                        # logger.info(f"[분석 완료 - JSON 결과물]\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
+
+                        # 5. 마지막으로 Spring API 서버로 HTTP POST 전송 시도
+                        response = await http_client.post(self._spring_api_url, json=payload)
+                        response.raise_for_status() # 200번대 성공이 아니면 여기서 HTTPError 발생
+                        logger.info(f"[전송 성공] case_id={case_id} Spring API 전송 완료")
                     
                 except httpx.HTTPError as e:
                     logger.error(f"[HTTP 전송 실패] case_id={case_id} API 연동 중 오류 발생: {e}")
@@ -135,4 +144,5 @@ class CdcAnalysisService:
                     logger.error(f"[시스템 오류] case_id={case_id} 처리 중 알 수 없는 예외 발생: {e}", exc_info=True)
                 finally:
                     # 큐 작업 하나가 끝났음을 알려줌
-                    self._queue.task_done()
+                    if task_received:
+                        self._queue.task_done()

@@ -5,6 +5,7 @@ from threading import Lock
 from typing import Any
 
 from app.core.config import Settings
+from app.infra.pinpoint_tracing import install_hybrid_trace_context
 
 _PINPOINT_INIT_LOCK = Lock()
 _PINPOINT_INITIALIZED = False
@@ -26,8 +27,8 @@ def build_fastapi_pinpoint_middleware(settings: Settings) -> list[Any]:
         from pinpointPy.Fastapi import (
             PinPointMiddleWare,
             async_monkey_patch_for_pinpoint,
-            use_starlette_context,
         )
+        from pinpointPy.libs import monkey_patch_for_pinpoint
     except ImportError:
         logging.exception("Pinpoint Python dependencies are not installed. Skipping Pinpoint startup.")
         return []
@@ -37,7 +38,7 @@ def build_fastapi_pinpoint_middleware(settings: Settings) -> list[Any]:
         collector_agent_uri=collector_agent_uri,
         set_agent=set_agent,
         async_monkey_patch_for_pinpoint=async_monkey_patch_for_pinpoint,
-        use_starlette_context=use_starlette_context,
+        monkey_patch_for_pinpoint=monkey_patch_for_pinpoint,
     )
 
     return [
@@ -51,7 +52,7 @@ def _initialize_pinpoint(
     collector_agent_uri: str,
     set_agent: Any,
     async_monkey_patch_for_pinpoint: Any,
-    use_starlette_context: Any,
+    monkey_patch_for_pinpoint: Any,
 ) -> None:
     global _PINPOINT_INITIALIZED
 
@@ -70,8 +71,19 @@ def _initialize_pinpoint(
             settings.pinpoint_timeout_ms,
             _resolve_log_level(settings.pinpoint_log_level),
         )
-        use_starlette_context()
+        install_hybrid_trace_context()
         async_monkey_patch_for_pinpoint(AioRedis=False, httpx=True)
+        monkey_patch_for_pinpoint(
+            pymongo=False,
+            PyMysql=False,
+            pyRedis=False,
+            requests=False,
+            urllib=False,
+            sqlalchemy=True,
+            MySQLdb=False,
+            MysqlConnector=False,
+            pyscopg2=False,
+        )
         logging.info(
             "Pinpoint Python agent initialized app=%s agent=%s collector=%s",
             settings.pinpoint_application_name,
