@@ -12,6 +12,31 @@ class Settings(BaseSettings):
     app_env: str = "local"
     app_mode: str = Field(default="", validation_alias=AliasChoices("APP_MODE"))
     debug: bool = False
+    pinpoint_enabled: bool = Field(default=False, validation_alias=AliasChoices("PINPOINT_ENABLED"))
+    pinpoint_agent_id: str = Field(
+        default="intelligence-server",
+        validation_alias=AliasChoices("PINPOINT_AGENT_ID"),
+    )
+    pinpoint_application_name: str = Field(
+        default="intelligence-server",
+        validation_alias=AliasChoices("PINPOINT_APPLICATION_NAME"),
+    )
+    pinpoint_collector_agent_uri: str = Field(
+        default="",
+        validation_alias=AliasChoices("PINPOINT_COLLECTOR_AGENT_URI"),
+    )
+    pinpoint_trace_limit: int = Field(
+        default=-1,
+        validation_alias=AliasChoices("PINPOINT_TRACE_LIMIT"),
+    )
+    pinpoint_timeout_ms: int = Field(
+        default=0,
+        validation_alias=AliasChoices("PINPOINT_TIMEOUT_MS"),
+    )
+    pinpoint_log_level: str = Field(
+        default="INFO",
+        validation_alias=AliasChoices("PINPOINT_LOG_LEVEL"),
+    )
     cdc_analysis_enabled: bool | None = Field(
         default=None,
         validation_alias=AliasChoices("CDC_ANALYSIS_ENABLED"),

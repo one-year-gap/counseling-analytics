@@ -1,5 +1,7 @@
 fastapi==0.115.8
 uvicorn[standard]==0.34.0
+pinpointPy==1.3.1
+starlette-context==0.4.0
 pydantic==2.10.6
 pydantic-settings==2.8.0
 aiokafka==0.11.0

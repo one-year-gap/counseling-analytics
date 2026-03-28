@@ -32,7 +32,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:${PATH}" \
     APP_MODE=server \
     APP_HOST=0.0.0.0 \
-    APP_PORT=8000
+    APP_PORT=8000 \
+    PINPOINT_ENABLED=false \
+    PINPOINT_AGENT_ID=intelligence-server \
+    PINPOINT_APPLICATION_NAME=intelligence-server \
+    PINPOINT_COLLECTOR_AGENT_URI="" \
+    PINPOINT_TRACE_LIMIT=-1 \
+    PINPOINT_TIMEOUT_MS=0 \
+    PINPOINT_LOG_LEVEL=INFO
 
 RUN addgroup --system appgroup \
     && adduser --system --ingroup appgroup --home /app appuser
