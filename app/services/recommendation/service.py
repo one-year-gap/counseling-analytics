@@ -144,9 +144,15 @@ async def get_recommendation(
         )
 
 
-async def run_recommendation_and_publish_to_kafka(member_id: int) -> None:
+async def run_recommendation_and_publish_to_kafka(member_id: int, trace_id: str | None = None) -> None:
     try:
         resp = await get_recommendation(session=None, member_id=member_id)
-        await publish_recommendation_to_kafka(member_id, resp)
+        await publish_recommendation_to_kafka(member_id, resp, trace_id=trace_id)
     except Exception as e:
-        logger.error("recommendation: 백그라운드 추천/Kafka 실패 member_id=%s: %s", member_id, e, exc_info=True)
+        logger.error(
+            "recommendation: 백그라운드 추천/Kafka 실패 member_id=%s trace_id=%s: %s",
+            member_id,
+            (trace_id or "").strip(),
+            e,
+            exc_info=True,
+        )
