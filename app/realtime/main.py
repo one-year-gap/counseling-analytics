@@ -15,6 +15,11 @@ from app.infra.kafka.recommendation_producer import (
     start_recommendation_kafka_producer,
     stop_recommendation_kafka_producer,
 )
+from app.infra.openai.app_client import (
+    get_openai_client,
+    start_openai_client,
+    stop_openai_client,
+)
 from app.realtime.api.router import api_router
 from app.services.cdc_analysis_service import CdcAnalysisService
 
@@ -40,12 +45,17 @@ async def lifespan(application: FastAPI):
         application.state.cdc_service = cdc_service
         logging.info("CDC analysis service enabled inside unified intelligence runtime.")
 
+    start_openai_client(runtime_settings)
+    application.state.openai_client = get_openai_client()
+
     await start_recommendation_kafka_producer(runtime_settings)
 
     try:
         yield
     finally:
         await stop_recommendation_kafka_producer()
+        await stop_openai_client()
+        application.state.openai_client = None
         if cdc_service is not None:
             await cdc_service.stop()
 

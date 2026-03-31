@@ -20,6 +20,7 @@ from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.infra.kafka.client_options import build_kafka_client_options
 from app.infra.kafka.recommendation_producer import get_recommendation_kafka_producer
+from app.infra.openai.app_client import get_openai_client
 from app.schemas.recommendation import (
     RecommendedProductItem,
     RecommendationResponse,
@@ -1452,7 +1453,9 @@ async def get_recommendation(
             updated_at=_utc_now_iso(),
         )
 
-    client = AsyncOpenAI(api_key=api_key)
+    client = get_openai_client()
+    if client is None:
+        client = AsyncOpenAI(api_key=api_key)
     service = RecommendationService(settings=settings, client=client)
     try:
         return await service.recommend_for_member(member_id)
