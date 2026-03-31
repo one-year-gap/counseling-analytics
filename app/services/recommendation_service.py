@@ -76,16 +76,24 @@ ORDER BY (embedding_vector <#> :query_vec)
 LIMIT :k
 """)
 
-# product_type별 벡터 검색: 타입을 분산시켜 후보 풀 편향을 완화
-SEARCH_SIMILAR_BY_TYPE_SQL = text("""
-SELECT product_id
-FROM product
-WHERE embedding_vector IS NOT NULL
-  AND product_type = :ptype
-  AND (NOT (product_id = ANY(:exclude_ids)))
-ORDER BY embedding_vector <#> :query_vec
-LIMIT :k
-""")
+# MAIN_PRODUCT_TYPES 전체를 한 번에: 타입별 ROW_NUMBER로 per_type_k개씩 (순차 5회 쿼리 대체)
+SEARCH_SIMILAR_MAIN_TYPES_WINDOW_SQL = text("""
+SELECT product_id, product_type, rn
+FROM (
+  SELECT
+    product_id,
+    product_type,
+    ROW_NUMBER() OVER (
+      PARTITION BY product_type
+      ORDER BY embedding_vector <#> :query_vec
+    ) AS rn
+  FROM product
+  WHERE embedding_vector IS NOT NULL
+    AND product_type IN :main_types
+    AND (NOT (product_id = ANY(:exclude_ids)))
+) ranked
+WHERE ranked.rn <= :per_type_k
+""").bindparams(bindparam("main_types", expanding=True))
 
 # 추천 후보 상품 상세 조회. data_amount는 OVER/UNDER 재정렬용 (mobile_plan·tab_watch_plan)
 FETCH_PRODUCTS_FULL_SQL = text("""
@@ -121,6 +129,45 @@ MAIN_PRODUCT_TYPES: tuple[str, ...] = (
     "ADDON",
 )
 RETRIEVAL_PER_TYPE_K = 10
+
+
+async def _retrieve_product_ids_per_main_type_window(
+    session: AsyncSession,
+    query_vec: list[float],
+    exclude_ids: list[int],
+    per_type_k: int,
+) -> list[int]:
+    """
+    MAIN_PRODUCT_TYPES별 벡터 유사도 상위 per_type_k개를 단일 쿼리로 조회.
+    반환 순서는 기존 순차 루프와 동일: 타입은 MAIN_PRODUCT_TYPES 순, 타입 내는 거리 오름차순.
+    """
+    result = await session.execute(
+        SEARCH_SIMILAR_MAIN_TYPES_WINDOW_SQL,
+        {
+            "query_vec": query_vec,
+            "exclude_ids": exclude_ids,
+            "per_type_k": per_type_k,
+            "main_types": list(MAIN_PRODUCT_TYPES),
+        },
+    )
+    rows = result.fetchall()
+    by_type: dict[str, list[tuple[int, int]]] = {}
+    for row in rows:
+        pid = int(row[0])
+        ptype = (str(row[1]) if row[1] is not None else "").strip().upper()
+        rn = int(row[2])
+        by_type.setdefault(ptype, []).append((pid, rn))
+    for key in by_type:
+        by_type[key].sort(key=lambda x: x[1])
+    product_ids: list[int] = []
+    seen: set[int] = set()
+    for ptype in MAIN_PRODUCT_TYPES:
+        for pid, _ in by_type.get(ptype, []):
+            if pid not in seen:
+                product_ids.append(pid)
+                seen.add(pid)
+    return product_ids
+
 
 # member_llm_context 미구축 시 사용할 기본 쿼리 텍스트
 DEFAULT_RETRIEVAL_QUERY = "통신 요금제, 데이터 요금제, 부가서비스 추천"
@@ -681,25 +728,14 @@ async def _run_recommendation_with_context(
     boost_type1, boost1, boost_type2, boost2 = _product_type_boost_from_weights(product_type_weights)
     use_type_boost = (boost1 > 0 or boost2 > 0)
 
-    # 2-1) 타입별 검색으로 후보 풀 분산(최소 1개/타입 유도)
-    seen: set[int] = set()
-    product_ids: list[int] = []
-    for ptype in MAIN_PRODUCT_TYPES:
-        r = await session.execute(
-            SEARCH_SIMILAR_BY_TYPE_SQL,
-            {
-                "query_vec": query_vec,
-                "exclude_ids": exclude_ids,
-                "ptype": ptype,
-                "k": RETRIEVAL_PER_TYPE_K,
-            },
-        )
-        for row in r.fetchall():
-            pid = row[0]
-            if pid in seen:
-                continue
-            product_ids.append(pid)
-            seen.add(pid)
+    # 2-1) 타입별 검색으로 후보 풀 분산(단일 윈도우 쿼리)
+    product_ids = await _retrieve_product_ids_per_main_type_window(
+        session,
+        query_vec,
+        exclude_ids,
+        RETRIEVAL_PER_TYPE_K,
+    )
+    seen: set[int] = set(product_ids)
 
     # 2-2) 부족분은 기존 전체 검색(가중치 boost 포함 가능)으로 보충
     if len(product_ids) < RETRIEVAL_CANDIDATES_K:
@@ -1075,25 +1111,14 @@ async def _run_fallback_recommendation(
                 updated_at=_utc_now_iso(),
             )
 
-        # 폴백에서도 타입별 후보를 먼저 확보해 모바일 쏠림을 완화
-        seen: set[int] = set()
-        product_ids: list[int] = []
-        for ptype in MAIN_PRODUCT_TYPES:
-            r = await fallback_session.execute(
-                SEARCH_SIMILAR_BY_TYPE_SQL,
-                {
-                    "query_vec": query_vec,
-                    "exclude_ids": [0],
-                    "ptype": ptype,
-                    "k": RETRIEVAL_PER_TYPE_K,
-                },
-            )
-            for row in r.fetchall():
-                pid = row[0]
-                if pid in seen:
-                    continue
-                product_ids.append(pid)
-                seen.add(pid)
+        # 폴백에서도 타입별 후보를 먼저 확보해 모바일 쏠림을 완화 (단일 윈도우 쿼리)
+        product_ids = await _retrieve_product_ids_per_main_type_window(
+            fallback_session,
+            query_vec,
+            [0],
+            RETRIEVAL_PER_TYPE_K,
+        )
+        seen: set[int] = set(product_ids)
 
         if len(product_ids) < RETRIEVAL_CANDIDATES_K:
             result = await fallback_session.execute(
