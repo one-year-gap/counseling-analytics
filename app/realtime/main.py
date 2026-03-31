@@ -25,7 +25,6 @@ from app.services.cdc_analysis_service import CdcAnalysisService
 
 settings = get_settings()
 configure_logging(settings.debug)
-pinpoint_middleware = build_fastapi_pinpoint_middleware(settings)
 
 
 def _mask_database_url(url: str) -> str:
@@ -69,7 +68,6 @@ def create_app() -> FastAPI:
     application = FastAPI(
         title=settings.app_name,
         lifespan=lifespan,
-        middleware=pinpoint_middleware,
     )
     application.include_router(api_router, prefix=settings.api_v1_prefix)
 
@@ -79,7 +77,6 @@ def create_app() -> FastAPI:
         url = runtime_settings.effective_database_url
         logging.info("DB 연결 대상: %s", _mask_database_url(url))
         logging.info("APP_MODE: %s", runtime_settings.app_mode or "(unset)")
-        logging.info("Pinpoint enabled: %s", runtime_settings.pinpoint_enabled)
         logging.info(
             "CDC analysis enabled: %s",
             runtime_settings.effective_cdc_analysis_enabled,
