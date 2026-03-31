@@ -1,6 +1,8 @@
 import json
 import logging
 import re
+import time
+import uuid
 from datetime import datetime, timezone
 
 try:
@@ -141,6 +143,25 @@ NO_CANDIDATE_MESSAGE = "추천할 수 있는 상품이 없습니다."
 NO_MATCHED_MESSAGE = "조건에 맞는 추천 상품이 없습니다."
 FALLBACK_CACHED_MESSAGE = "고객님의 이용 패턴과 관심사를 반영한 요금제·부가서비스 추천입니다."
 FALLBACK_VECTOR_SUMMARY = "고객님께 어울리는 상품을 추천해드릴게요!"
+
+
+def _now_ms() -> int:
+    return int(time.monotonic() * 1000)
+
+
+def _elapsed_ms(start_ms: int) -> int:
+    return max(0, _now_ms() - start_ms)
+
+
+def _ensure_trace_id(trace_id: str | None) -> str:
+    return (trace_id or "").strip() or uuid.uuid4().hex[:12]
+
+
+def _rec_log(trace_id: str, member_id: int, stage: str, **fields: object) -> None:
+    suffix = ""
+    if fields:
+        suffix = " " + " ".join(f"{k}={v}" for k, v in fields.items())
+    logger.info("[REC][trace_id=%s][member_id=%s] %s%s", trace_id, member_id, stage, suffix)
 
 
 def _normalize_embedding_for_db(embedding: list[float]) -> list[float]:
@@ -623,6 +644,7 @@ async def _run_recommendation_with_context(
     ctx: dict,
     settings: object,
     client: AsyncOpenAI,
+    trace_id: str | None = None,
 ) -> RecommendationResponse | None:
     """
     member_llm_context가 있을 때 사용하는 라이브 추천 경로.
@@ -635,10 +657,13 @@ async def _run_recommendation_with_context(
     중간 단계(임베딩 생성, retrieval, LLM 호출)에서 실패하면 None을 반환하고 상위에서 폴백 경로를 사용한다.
     """
     top_k = getattr(settings, "recommend_top_k", 3)
+    trace_id = _ensure_trace_id(trace_id)
     # 1) ctx 기반 쿼리 텍스트와 임베딩 생성
+    t_prompt_build = _now_ms()
     query_text = build_retrieval_query_text(ctx)
     exclude_ids = _exclude_ids_from_context(ctx)
     emb_model = getattr(settings, "openai_embedding_model", "")
+    _rec_log(trace_id, member_id, "prompt_build_done", elapsed_ms=_elapsed_ms(t_prompt_build))
     logger.info(
         "OpenAI 임베딩 호출 직전: member_id=%s model=%s query_text_len=%d query_text_preview=%s",
         member_id,
@@ -650,6 +675,8 @@ async def _run_recommendation_with_context(
     # CHURN_RISK일 때 동일 product_type 기준 가격 상한용 (한 상품 vs 같은 타입 현재 가격)
     type_caps = await _get_subscription_max_price_by_type(session, ctx) if (ctx.get("segment") or "").strip().upper() == "CHURN_RISK" else {}
 
+    _rec_log(trace_id, member_id, "embedding_start")
+    t_embedding = _now_ms()
     try:
         emb_resp = await client.embeddings.create(
             model=settings.openai_embedding_model,
@@ -671,12 +698,15 @@ async def _run_recommendation_with_context(
             e,
             exc_info=True,
         )
+        _rec_log(trace_id, member_id, "embedding_failed", elapsed_ms=_elapsed_ms(t_embedding), error_type=type(e).__name__)
         return None
+    _rec_log(trace_id, member_id, "embedding_done", elapsed_ms=_elapsed_ms(t_embedding))
     query_vec = _normalize_embedding_for_db(query_vec)
     if query_vec is None:
         return None
 
     # 2) pgvector 유사도 검색 (member_llm_context 기반 product_type 가중치 포함)
+    t_retrieval = _now_ms()
     product_type_weights = compute_product_type_weights(ctx)
     boost_type1, boost1, boost_type2, boost2 = _product_type_boost_from_weights(product_type_weights)
     use_type_boost = (boost1 > 0 or boost2 > 0)
@@ -749,6 +779,7 @@ async def _run_recommendation_with_context(
         r = dict(row)
         id_to_row[r["product_id"]] = r
     products_ordered = [id_to_row[pid] for pid in product_ids if pid in id_to_row]
+    _rec_log(trace_id, member_id, "retrieval_done", elapsed_ms=_elapsed_ms(t_retrieval), docs_count=len(products_ordered))
 
     # 디버깅: 벡터 검색 직후 product_type 분포 확인
     type_counts: dict[str, int] = {}
@@ -824,6 +855,7 @@ async def _run_recommendation_with_context(
         p["sale_price"] = int(p.get("sale_price") or p.get("price") or 0)
         p["tags"] = _normalize_tags(p.get("tags"))
 
+    t_prompt_build2 = _now_ms()
     products_text = format_products(products_ordered)
     segment = (ctx.get("segment") or "NORMAL").strip()
     persona_code = ctx.get("persona_code")
@@ -848,6 +880,7 @@ async def _run_recommendation_with_context(
         "]"
         "}"
     )
+    _rec_log(trace_id, member_id, "prompt_build_done", elapsed_ms=_elapsed_ms(t_prompt_build2))
     chat_model = getattr(settings, "openai_chat_model", "")
     system_len = len(system_prompt + "\n\n" + json_instruction)
     user_len = len(user_prompt or "")
@@ -859,6 +892,8 @@ async def _run_recommendation_with_context(
         user_len,
         len(products_ordered[:top_k]),
     )
+    _rec_log(trace_id, member_id, "chat_start")
+    t_chat = _now_ms()
     try:
         resp = await client.chat.completions.create(
             model=settings.openai_chat_model,
@@ -911,7 +946,9 @@ async def _run_recommendation_with_context(
             for p in products_ordered[:top_k]
         ]
         cached = "고객님의 이용 패턴과 관심사를 반영한 요금제·부가서비스 추천입니다."
+    _rec_log(trace_id, member_id, "chat_done", elapsed_ms=_elapsed_ms(t_chat))
 
+    t_result_save = _now_ms()
     recommended_products: list[RecommendedProductItem] = []
     used_ids: set[int] = set()
     type_counts: dict[str, int] = {}
@@ -971,6 +1008,13 @@ async def _run_recommendation_with_context(
                 )
             )
             used_ids.add(pid)
+    _rec_log(
+        trace_id,
+        member_id,
+        "recommendation_result_save_done",
+        elapsed_ms=_elapsed_ms(t_result_save),
+        products=len(recommended_products),
+    )
 
     return RecommendationResponse(
         segment=_segment_enum(ctx.get("segment")),
@@ -985,9 +1029,12 @@ async def _run_fallback_recommendation(
     client: AsyncOpenAI,
     settings: object,
     top_k: int,
+    member_id: int = 0,
+    trace_id: str | None = None,
 ) -> RecommendationResponse:
     """폴백: 새 세션(새 커넥션)에서 벡터 검색 + LLM. 중단된 트랜잭션 영향 없음."""
     logger.info("recommendation: 폴백 시작 (고정 쿼리 벡터 검색) top_k=%s", top_k)
+    trace_id = _ensure_trace_id(trace_id)
     if SessionLocal is None:
         return RecommendationResponse(
             segment=Segment.normal,
@@ -998,6 +1045,8 @@ async def _run_fallback_recommendation(
         )
     emb_model = getattr(settings, "openai_embedding_model", "")
     async with SessionLocal() as fallback_session:
+        _rec_log(trace_id, member_id, "embedding_start")
+        t_embedding = _now_ms()
         try:
             logger.info(
                 "OpenAI 임베딩 호출 직전 (폴백): model=%s input_preview=%s",
@@ -1037,6 +1086,7 @@ async def _run_fallback_recommendation(
                     updated_at=_utc_now_iso(),
                 )
             recommended_products: list[RecommendedProductItem] = []
+            t_result_save = _now_ms()
             type_counts: dict[str, int] = {}
             for i, row in enumerate(rows):
                 p = dict(row)
@@ -1065,6 +1115,7 @@ async def _run_fallback_recommendation(
                 source="LIVE",
                 updated_at=_utc_now_iso(),
             )
+        _rec_log(trace_id, member_id, "embedding_done", elapsed_ms=_elapsed_ms(t_embedding))
         query_vec = _normalize_embedding_for_db(query_vec)
         if query_vec is None:
             return RecommendationResponse(
@@ -1075,6 +1126,7 @@ async def _run_fallback_recommendation(
                 updated_at=_utc_now_iso(),
             )
 
+        t_retrieval = _now_ms()
         # 폴백에서도 타입별 후보를 먼저 확보해 모바일 쏠림을 완화
         seen: set[int] = set()
         product_ids: list[int] = []
@@ -1128,6 +1180,7 @@ async def _run_fallback_recommendation(
             r = dict(row)
             id_to_row[r["product_id"]] = r
         products_ordered = [id_to_row[pid] for pid in product_ids if pid in id_to_row]
+        _rec_log(trace_id, member_id, "retrieval_done", elapsed_ms=_elapsed_ms(t_retrieval), docs_count=len(products_ordered))
 
         # 디버깅: 폴백 벡터 검색 직후 product_type 분포 확인
         fb_type_counts: dict[str, int] = {}
@@ -1162,12 +1215,16 @@ async def _run_fallback_recommendation(
             for p in products_ordered
         ]
         logger.info("recommendation: 폴백 LLM reason 생성 요청 상품=%d", len(summaries))
+        _rec_log(trace_id, member_id, "chat_start")
+        t_chat = _now_ms()
         reasons = await _generate_recommendation_reasons(
             client,
             settings.openai_chat_model,
             summaries,
         )
+        _rec_log(trace_id, member_id, "chat_done", elapsed_ms=_elapsed_ms(t_chat))
         recommended_products: list[RecommendedProductItem] = []
+        t_result_save = _now_ms()
         type_counts: dict[str, int] = {}
         for p in products_ordered:
             if not _check_and_update_product_type_count(p, type_counts, MAX_PRODUCTS_PER_TYPE):
@@ -1196,23 +1253,40 @@ async def _run_fallback_recommendation(
             source="LIVE",
             updated_at=_utc_now_iso(),
         )
+        _rec_log(
+            trace_id,
+            member_id,
+            "recommendation_result_save_done",
+            elapsed_ms=_elapsed_ms(t_result_save),
+            products=len(recommended_products),
+        )
+        return response
 
 
-async def run_recommendation_and_publish_to_kafka(member_id: int) -> None:
+async def run_recommendation_and_publish_to_kafka(member_id: int, trace_id: str | None = None) -> None:
     """백그라운드: 추천 생성 후 Kafka 발행. Spring이 202 후 이 메시지를 consume해 DB 적재·CompletableFuture 완료."""
+    trace_id = _ensure_trace_id(trace_id)
+    t_total = _now_ms()
+    _rec_log(trace_id, member_id, "start")
     try:
-        resp = await get_recommendation(session=None, member_id=member_id)
-        await publish_recommendation_to_kafka(member_id, resp)
+        resp = await get_recommendation(session=None, member_id=member_id, trace_id=trace_id)
+        t_kafka = _now_ms()
+        await publish_recommendation_to_kafka(member_id, resp, trace_id=trace_id)
+        _rec_log(trace_id, member_id, "kafka_publish_done", elapsed_ms=_elapsed_ms(t_kafka))
+        _rec_log(trace_id, member_id, "end", total_ms=_elapsed_ms(t_total))
     except Exception as e:
         logger.error("recommendation: 백그라운드 추천/Kafka 실패 member_id=%s: %s", member_id, e, exc_info=True)
+        _rec_log(trace_id, member_id, "failed", total_ms=_elapsed_ms(t_total), error_type=type(e).__name__)
 
 
 async def publish_recommendation_to_kafka(
     member_id: int,
     response: RecommendationResponse,
+    trace_id: str | None = None,
 ) -> None:
     """추천 결과를 Kafka recommendation-topic으로 발행. Spring Consumer가 수신 후 persona_recommendation 적재."""
     settings = get_settings()
+    trace_id = _ensure_trace_id(trace_id)
     topic = getattr(settings, "kafka_recommendation_topic", "recommendation")
     bootstrap = getattr(settings, "kafka_bootstrap_servers", "").strip()
     if AIOKafkaProducer is None:
@@ -1227,9 +1301,11 @@ async def publish_recommendation_to_kafka(
         **build_kafka_client_options(settings),
     )
     try:
+        t_publish = _now_ms()
         await producer.start()
         await producer.send_and_wait(topic, value=payload, key=str(member_id).encode("utf-8"))
         logger.info("recommendation: Kafka 발행 완료 member_id=%s topic=%s", member_id, topic)
+        _rec_log(trace_id, member_id, "kafka_publish_internal_done", elapsed_ms=_elapsed_ms(t_publish))
     except Exception as e:
         logger.error("recommendation: Kafka 발행 실패 member_id=%s: %s", member_id, e, exc_info=True)
     finally:
@@ -1289,6 +1365,7 @@ class RecommendationService:
         session: AsyncSession,
         member_id: int,
         ctx: dict,
+        trace_id: str | None = None,
     ) -> RecommendationResponse | None:
         """
         ctx가 존재할 때 ctx 기반 RAG 추천을 실행한다.
@@ -1300,9 +1377,10 @@ class RecommendationService:
             ctx=ctx,
             settings=self.settings,
             client=self.client,
+            trace_id=trace_id,
         )
 
-    async def _run_fallback(self, top_k: int) -> RecommendationResponse:
+    async def _run_fallback(self, top_k: int, member_id: int, trace_id: str | None = None) -> RecommendationResponse:
         """
         ctx가 없거나 ctx 경로에서 오류가 난 경우 사용하는 폴백 추천 경로를 실행한다.
         내부 구현은 _run_fallback_recommendation에 위임한다.
@@ -1311,9 +1389,11 @@ class RecommendationService:
             client=self.client,
             settings=self.settings,
             top_k=top_k,
+            member_id=member_id,
+            trace_id=trace_id,
         )
 
-    async def recommend_for_member(self, member_id: int) -> RecommendationResponse:
+    async def recommend_for_member(self, member_id: int, trace_id: str | None = None) -> RecommendationResponse:
         """
         외부에서 사용하는 member_id 기준 추천 진입점.
 
@@ -1322,6 +1402,7 @@ class RecommendationService:
         3) ctx가 없거나 ctx 경로에서 실패하면 폴백 벡터 검색 + LLM 경로로 추천을 생성한다.
         """
         logger.info("recommendation: 요청 시작 member_id=%s", member_id)
+        trace_id = _ensure_trace_id(trace_id)
         top_k = getattr(self.settings, "recommend_top_k", 3)
 
         if SessionLocal is None:
@@ -1335,7 +1416,9 @@ class RecommendationService:
             )
 
         async with SessionLocal() as worker_session:
+            t_ctx = _now_ms()
             ctx: dict | None = await self._load_member_context(worker_session, member_id)
+            _rec_log(trace_id, member_id, "context_done", elapsed_ms=_elapsed_ms(t_ctx))
 
             if ctx:
                 logger.info(
@@ -1349,6 +1432,7 @@ class RecommendationService:
                         session=worker_session,
                         member_id=member_id,
                         ctx=ctx,
+                        trace_id=trace_id,
                     )
                     if resp is not None:
                         logger.info(
@@ -1373,7 +1457,7 @@ class RecommendationService:
             "recommendation: 폴백 경로 진입 (member_llm_context 없음 또는 ctx 추천 실패, member_id=%s)",
             member_id,
         )
-        resp = await self._run_fallback(top_k=top_k)
+        resp = await self._run_fallback(top_k=top_k, member_id=member_id, trace_id=trace_id)
         logger.info(
             "recommendation: 폴백 경로 완료 member_id=%s segment=%s products=%s",
             member_id,
@@ -1386,6 +1470,7 @@ class RecommendationService:
 async def get_recommendation(
     session: AsyncSession | None,
     member_id: int,
+    trace_id: str | None = None,
 ) -> RecommendationResponse:
     """
     member_id 기준 추천 진입점.
@@ -1394,6 +1479,7 @@ async def get_recommendation(
     - 내부적으로 RecommendationService를 생성해 ctx 경로와 폴백 경로를 포함한 전체 RAG 파이프라인을 실행한다.
     """
     _ = session
+    trace_id = _ensure_trace_id(trace_id)
     settings = get_settings()
     api_key = getattr(settings, "openai_api_key", "") or ""
     has_key = bool(api_key and api_key.strip())
@@ -1420,7 +1506,7 @@ async def get_recommendation(
     client = AsyncOpenAI(api_key=api_key)
     service = RecommendationService(settings=settings, client=client)
     try:
-        return await service.recommend_for_member(member_id)
+        return await service.recommend_for_member(member_id, trace_id=trace_id)
     except Exception as e:
         logger.exception(
             "get_recommendation: OpenAI 또는 추천 파이프라인 예외 member_id=%s error_type=%s error=%s",
