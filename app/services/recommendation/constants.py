@@ -80,7 +80,7 @@ ORDER BY p.product_id
 LIMIT :k
 """)
 
-RETRIEVAL_CANDIDATES_K = 50
+RETRIEVAL_CANDIDATES_K = 30
 
 MAIN_PRODUCT_TYPES: tuple[str, ...] = (
     "MOBILE_PLAN",

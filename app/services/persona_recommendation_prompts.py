@@ -3,6 +3,10 @@ Phase 5: segment·persona별 시스템 프롬프트, 유저 프롬프트, 상품
 명세 8장: segment가 추천 제약, persona가 마케팅·reason 스타일 결정.
 """
 
+from __future__ import annotations
+
+import re
+
 
 SEGMENT_SYSTEM_PROMPTS = {
     "CHURN_RISK": """당신은 통신사 고객 이탈 방지 전문 추천 AI예요.
@@ -81,6 +85,62 @@ def get_persona_style_prompt(persona_code: str | None) -> str:
     return PERSONA_STYLE_PROMPTS.get(code, PERSONA_STYLE_PROMPTS["SPACE_EXPLORER"])
 
 
+def _extract_block(raw: str, label: str) -> str:
+    # [라벨] 다음 줄부터 다음 [라벨] 이전까지를 추출한다.
+    pattern = rf"{re.escape(label)}\s*(.*?)(?=\n\[[^\]]+\]|\Z)"
+    m = re.search(pattern, raw, flags=re.DOTALL)
+    return (m.group(1).strip() if m else "")
+
+
+def _compact_embedding_text(text: str, max_chars: int = 250, max_target_reasons: int = 2) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    name = _extract_block(raw, "[상품명]")
+    price = _extract_block(raw, "[가격]")
+    ptype = _extract_block(raw, "[상품유형]")
+    tags = _extract_block(raw, "[태그]")
+    target_section = _extract_block(raw, "[추천 대상/상황]")
+
+    compact_lines: list[str] = []
+    if name:
+        compact_lines.append(f"[상품명] {name}")
+    if price:
+        compact_lines.append(f"[가격] {price}")
+    if ptype:
+        compact_lines.append(f"[상품유형] {ptype}")
+    if tags:
+        tag_items = [t.strip() for t in tags.split(",") if t.strip()]
+        if tag_items:
+            compact_lines.append(f"[태그] {', '.join(tag_items[:2])}")
+
+    if target_section:
+        pairs: list[str] = []
+        chunks = [c.strip() for c in target_section.split("|") if c.strip()]
+        for chunk in chunks:
+            t = re.search(r"\[대상\]\s*([^\[\]|·]+)", chunk)
+            r = re.search(r"\[추천 이유\]\s*([^\[\]|]+)", chunk)
+            target = (t.group(1).strip() if t else "")
+            reason = (r.group(1).strip() if r else "")
+            if target and reason:
+                pairs.append(f"[대상/이유] {target} - {reason}")
+            if len(pairs) >= max_target_reasons:
+                break
+        compact_lines.extend(pairs)
+
+    compact = "\n".join(compact_lines).strip()
+    if compact:
+        return compact[:max_chars]
+
+    # 구조화 태그가 없는 경우 문장 기반 폴백
+    chunks = [s.strip() for s in re.split(r"[.!?\n]+", raw) if s and s.strip()]
+    fallback = ". ".join(chunks[:3]).strip()
+    if fallback and not fallback.endswith("."):
+        fallback += "."
+    return fallback[:max_chars]
+
+
 def format_products(products: list[dict]) -> str:
     """LLM 유저 프롬프트에 넣을 상품 목록 문자열. 명세 8장 포맷."""
     lines = []
@@ -94,7 +154,11 @@ def format_products(products: list[dict]) -> str:
             tags_str = ", ".join(str(t) for t in tags)
         else:
             tags_str = str(tags) if tags else ""
-        embedding_text = (p.get("embedding_text") or "").strip()
+        embedding_text = _compact_embedding_text(
+            (p.get("embedding_text") or "").strip(),
+            max_chars=250,
+            max_target_reasons=2,
+        )
         lines.append(
             f"{i}. product_id: {p.get('product_id')}\n"
             f"   product_name: {product_name}\n"
@@ -128,7 +192,7 @@ def build_user_prompt(ctx: dict, products_text: str) -> str:
     ]
     if recent_counseling:
         blocks.append("## 최근 상담 이력")
-        blocks.append(recent_counseling[:800])
+        blocks.append(recent_counseling[:300])
     blocks.append("## 후보 상품 목록 (이 중에서 최대 3개를 골라 추천하고, 각 product_id에 대해 reason을 작성하세요)")
     blocks.append(products_text)
 

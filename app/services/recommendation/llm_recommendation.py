@@ -177,12 +177,14 @@ async def run_recommendation_with_context(
     boost_type1, boost1, boost_type2, boost2 = product_type_boost_from_weights(product_type_weights)
     use_type_boost = boost1 > 0 or boost2 > 0
 
-    product_ids = await retrieve_product_ids_per_main_type_window(
-        session,
-        query_vec,
-        exclude_ids,
-        RETRIEVAL_PER_TYPE_K,
-    )
+    product_ids = (
+        await retrieve_product_ids_per_main_type_window(
+            session,
+            query_vec,
+            exclude_ids,
+            RETRIEVAL_PER_TYPE_K,
+        )
+    )[:RETRIEVAL_CANDIDATES_K]
     seen: set[int] = set(product_ids)
 
     if len(product_ids) < RETRIEVAL_CANDIDATES_K:
@@ -539,12 +541,14 @@ async def run_fallback_recommendation(
                 updated_at=utc_now_iso(),
             )
 
-        product_ids = await retrieve_product_ids_per_main_type_window(
-            fallback_session,
-            query_vec,
-            [0],
-            RETRIEVAL_PER_TYPE_K,
-        )
+        product_ids = (
+            await retrieve_product_ids_per_main_type_window(
+                fallback_session,
+                query_vec,
+                [0],
+                RETRIEVAL_PER_TYPE_K,
+            )
+        )[:RETRIEVAL_CANDIDATES_K]
         seen: set[int] = set(product_ids)
 
         if len(product_ids) < RETRIEVAL_CANDIDATES_K:
