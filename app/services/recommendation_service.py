@@ -1295,7 +1295,7 @@ async def publish_recommendation_to_kafka(
     if not bootstrap:
         logger.warning("recommendation: Kafka 미설정, 발행 스킵 member_id=%s", member_id)
         return
-    payload = {"memberId": member_id, **response.model_dump(by_alias=True)}
+    payload = {"traceId": trace_id, "memberId": member_id, **response.model_dump(by_alias=True)}
     producer = AIOKafkaProducer(
         value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
         **build_kafka_client_options(settings),
