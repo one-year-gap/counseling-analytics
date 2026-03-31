@@ -3,7 +3,6 @@ Phase 3: member_llm_context 한 행으로 retrieval용 쿼리 텍스트 생성.
 구축/호출 시점에 사용하며, DB에는 저장하지 않음.
 """
 
-
 TYPE_LABELS: dict[str, str] = {
     "MOBILE_PLAN": "휴대폰 요금제",
     "INTERNET": "인터넷 상품",
@@ -52,7 +51,11 @@ def build_retrieval_query_text(ctx: dict) -> str:
         types_str = str(current_types) if current_types else ""
     data_ratio = ctx.get("current_data_usage_ratio")
     usage_pattern = (ctx.get("data_usage_pattern") or "").strip()
-    usage_str = f"데이터 사용량 {data_ratio}%로 {usage_pattern}" if data_ratio is not None else ""
+    usage_str = (
+        f"데이터 사용량 {data_ratio}%로 {usage_pattern}"
+        if data_ratio is not None
+        else ""
+    )
     recent_tags = ctx.get("recent_viewed_tags_top_3")
     if isinstance(recent_tags, list):
         tags_str = ", ".join(str(t) for t in recent_tags[:3])
